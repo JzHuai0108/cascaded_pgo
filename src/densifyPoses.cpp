@@ -10,15 +10,18 @@
 
 #include <eigen3/Eigen/Core>
 #include <eigen3/Eigen/Geometry>
-#include <glog/logging.h>
 
-#include "g2o/core/block_solver.h"
-#include "g2o/core/optimization_algorithm_levenberg.h"
-#include "g2o/core/robust_kernel_impl.h"
-#include "g2o/solvers/dense/linear_solver_dense.h"
-#include "g2o/solvers/eigen/linear_solver_eigen.h"
-#include "g2o/types/slam3d/types_slam3d.h"
-#include "g2o/types/slam3d_addons/types_slam3d_addons.h"
+#include "ceres/ceres.h"
+#include "glog/logging.h"
+
+#include "pose_factors.h"
+#include "pose_local_parameterization.h"
+
+using ceres::AutoDiffCostFunction;
+using ceres::CostFunction;
+using ceres::Problem;
+using ceres::Solve;
+using ceres::Solver;
 
 void loadcsv(const std::string &datafile,
              std::vector<std::vector<double>> &res) {
@@ -51,13 +54,6 @@ void savecsv(std::string outfile, std::vector<std::vector<double>> &data,
   ofs.close();
 }
 
-inline Eigen::Isometry3d toIsometry(const Eigen::Quaterniond &q, const Eigen::Vector3d &t) {
-  Eigen::Isometry3d iso = Eigen::Isometry3d::Identity();
-  iso.linear() = q.toRotationMatrix();
-  iso.translation() = t;
-  return iso;
-}
-
 void densifyPoses(const std::string &framePoseTxt,
                   const std::string &keyframePoseTxt) {
   std::cout << "Frame pose file " << framePoseTxt << "\nKeyframe pose file "
@@ -70,28 +66,18 @@ void densifyPoses(const std::string &framePoseTxt,
   // refer to loadCsvData in SimDataInterface.cpp of repo swift_vio.
   loadcsv(framePoseTxt, f_poses);
 
-  // 2. build the g2o optimization problem, refer to optimizeScaleTrans in
-  // scale_solver.cpp of this package, OR
-  // https://github.com/JzHuai0108/sim3opt/blob/master/kitti_surf.cpp#L542
-  g2o::SparseOptimizer optimizer;
-  optimizer.setVerbose(true);
-  std::unique_ptr<g2o::BlockSolver_6_3::LinearSolverType> linearSolver =
-      g2o::make_unique<
-          g2o::LinearSolverEigen<g2o::BlockSolver_6_3::PoseMatrixType>>();
-  g2o::OptimizationAlgorithmLevenberg *solver =
-      new g2o::OptimizationAlgorithmLevenberg(g2o::make_unique<g2o::BlockSolver_6_3>(std::move(linearSolver)));
-  optimizer.setAlgorithm(solver);
-
   // 2.1 states: SE3 poses for all frames. Frames includes all keyframes.
   // These states are represented by G2oVertexSE3
   // SET  VERTICES
   size_t count = 0;
   std::vector<int> kf_indices;
+  const int SIZE_POSE = 7;
+
+  std::vector<Eigen::Matrix<double, 7, 1>,
+              Eigen::aligned_allocator<Eigen::Matrix<double, 7, 1>>>
+      estimated_poses;
 
   for (size_t i = 0u; i < f_poses.size(); i++) {
-    g2o::VertexSE3 *v = new g2o::VertexSE3();
-    v->setId(i);
-
     // 2.1.1 initialization of SE3 poses: for keyframes, use the values loaded
     // from the file, for frames, initialize their poses relative to the nearest
     // keyframe using relative motion.
@@ -103,76 +89,73 @@ void densifyPoses(const std::string &framePoseTxt,
                                          kf_poses[count][6]);
       Eigen::Vector3d refKeyframeTrans(kf_poses[count][1], kf_poses[count][2],
                                        kf_poses[count][3]);
-      v->setEstimate(toIsometry(refKeyframeQuat, refKeyframeTrans));
+
+      Eigen::Map<Eigen::Matrix<double, 7, 1>> pose(&kf_poses[count][1]);
+      estimated_poses.push_back(pose);
       count++;
     } else {
-      Eigen::Quaterniond q(f_poses[count][7], f_poses[count][4],
-                           f_poses[count][5], f_poses[count][6]);
-      Eigen::Vector3d t(f_poses[count][1], f_poses[count][2],
-                        f_poses[count][3]);
-      v->setEstimate(toIsometry(q, t));
+      Eigen::Map<Eigen::Matrix<double, 7, 1>> pose(&f_poses[i][1]);
+      estimated_poses.push_back(pose);
     }
-
-    optimizer.addVertex(v);
   }
   CHECK_EQ(kf_indices.size(), kf_poses.size())
       << "Found keyframes in frames " << count << " and keyframe poses "
       << kf_poses.size() << ".";
+  CHECK_EQ(f_poses.size(), estimated_poses.size())
+      << "Frame poses " << f_poses.size() << " and initial poses "
+      << estimated_poses.size() << ".";
+
+  Problem problem;
+  ceres::LocalParameterization *local_parameterization =
+      new PoseLocalParameterization();
+  for (size_t i = 0; i < f_poses.size(); i++) {
+    problem.AddParameterBlock(estimated_poses[i].data(), SIZE_POSE,
+                              local_parameterization);
+  }
 
   // 2.2 observations: // SET EDGES
-  // SE3 pose priors for keyframes, represented by G2oSE3Observation6DEdge
+  // SE3 pose priors for keyframes
   for (size_t i = 0u; i < kf_poses.size(); i++) {
-    g2o::EdgeSE3Prior *e = new g2o::EdgeSE3Prior();
-    e->setVertex(0, optimizer.vertex(kf_indices[i]));
+    Eigen::Map<Eigen::Matrix<double, 7, 1>> pose(&kf_poses[i][1]);
 
-    Eigen::Quaterniond q(kf_poses[i][7], kf_poses[i][4], kf_poses[i][5],
-                         kf_poses[i][6]);
-    Eigen::Vector3d t(kf_poses[i][1], kf_poses[i][2], kf_poses[i][3]);
-    e->setMeasurement(toIsometry(q, t));
-    LOG(INFO) << "key " << i << " " << q.coeffs().transpose() << " t " << t.transpose();
-    Eigen::Matrix<double, 6, 6> infoMat;
-    infoMat.setIdentity();
-    e->setInformation(infoMat);
-    e->setParameterId(0, 0);
-    optimizer.addEdge(e);
+    CostFunction *cost_function = new EdgeSE3Prior(pose);
+    problem.AddResidualBlock(cost_function, nullptr,
+                             estimated_poses[kf_indices[i]].data());
   }
-  // SE3 relative motion constraints for consecutive frames, represented by
-  // G2oEdgeSE3
-  for (size_t i = 0; i < f_poses.size() - 1; i++) {
-    g2o::EdgeSE3 *e = new g2o::EdgeSE3();
-    e->setVertex(0, optimizer.vertex(i));
-    e->setVertex(1, optimizer.vertex(i + 1));
 
+  // SE3 relative motion constraints for consecutive frames
+  for (size_t i = 0; i < f_poses.size() - 1; i++) {
     Eigen::Quaterniond q1(f_poses[i][7], f_poses[i][4], f_poses[i][5],
                           f_poses[i][6]);
-    Eigen::Vector3d t1(f_poses[i][1], f_poses[i][2], f_poses[i][3]);
-    Eigen::Isometry3d Ta = toIsometry(q1, t1);
+    Eigen::Vector3d p1(f_poses[i][1], f_poses[i][2], f_poses[i][3]);
+
     Eigen::Quaterniond q2(f_poses[i + 1][7], f_poses[i + 1][4],
                           f_poses[i + 1][5], f_poses[i + 1][6]);
-    Eigen::Vector3d t2(f_poses[i + 1][1], f_poses[i + 1][2], f_poses[i + 1][3]);
-    Eigen::Isometry3d Tb = toIsometry(q2, t2);
-    e->setMeasurement(Ta.inverse() * Tb);
+    Eigen::Vector3d p2(f_poses[i + 1][1], f_poses[i + 1][2], f_poses[i + 1][3]);
 
-    Eigen::Matrix<double, 6, 6> infoMat;
-    infoMat.setIdentity();
-    e->setInformation(infoMat);
+    Eigen::Matrix<double, 7, 1> T_12;
+    Eigen::Map<Eigen::Quaterniond> q_12(T_12.data() + 3);
+    q_12 = q1.inverse() * q2;
+    Eigen::Map<Eigen::Vector3d> p_12(T_12.data());
+    p_12 = q1.inverse() * (p2 - p1);
 
-    optimizer.addEdge(e);
+    CostFunction *cost_function = new EdgeSE3(T_12);
+    problem.AddResidualBlock(cost_function, nullptr, estimated_poses[i].data(),
+                             estimated_poses[i + 1].data());
   }
-  LOG(INFO) << "Initialize optimization!";
-  optimizer.initializeOptimization();
-  // 2.4 optimize the poses
-  LOG(INFO) << "Optimize.";
-  optimizer.optimize(3);
-  LOG(INFO) << "Save!";
+
+  // Run the solver!
+  Solver::Options options;
+  options.minimizer_progress_to_stdout = true;
+  Solver::Summary summary;
+  Solve(options, &problem, &summary);
+
   // 3. save the refined frame poses to a csv file with the same format as the
   // poses.txt.
   for (size_t i = 0u; i < f_poses.size(); i++) {
-    g2o::VertexSE3 *v =
-        static_cast<g2o::VertexSE3 *>(optimizer.vertex(i));
-    Eigen::Matrix3d R = v->estimate().linear();
-    Eigen::Quaterniond q(R);
-    Eigen::Vector3d t = v->estimate().translation();
+
+    Eigen::Map<Eigen::Quaterniond> q(estimated_poses[i].data() + 3);
+    Eigen::Map<Eigen::Vector3d> t(estimated_poses[i].data());
     f_poses[i][1] = t(0);
     f_poses[i][2] = t(1);
     f_poses[i][3] = t(2);
@@ -181,7 +164,11 @@ void densifyPoses(const std::string &framePoseTxt,
     f_poses[i][6] = q.z();
     f_poses[i][7] = q.w();
   }
-  std::string outfile = "./densify_res.txt";
+  size_t pos = framePoseTxt.find_last_of("/\\");
+
+  std::string outfile = framePoseTxt.substr(0, pos) + "/dense_poses.txt";
+
+  LOG(INFO) << "Saving densified poses to " << outfile;
   std::string fileHead = "# timestamp tx ty tz qx qy qz qw";
   savecsv(outfile, f_poses, fileHead);
 }

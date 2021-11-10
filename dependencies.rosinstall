@@ -2,7 +2,7 @@
     local-name: catkin_simple
     uri: https://github.com/catkin/catkin_simple.git
 - git:
-    local-name: g2o_catkin
-    uri: git@bitbucket.org:JzHuai0108/g2o_catkin.git
+    local-name: ceres_catkin
+    uri: https://github.com/ethz-asl/ceres_catkin.git
 
 

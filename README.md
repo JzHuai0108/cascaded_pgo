@@ -1,7 +1,6 @@
 # densify_poses
 
-Depends on g2o.
-g2o will be downloaded as catkin packages.
+Depends on ceres solver which is wrapped in ceres_catkin.
 
 # Build
 
