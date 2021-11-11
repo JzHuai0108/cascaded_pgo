@@ -19,6 +19,8 @@ bool EdgeSE3::Evaluate(double const *const *parameters, double *residuals,
   Eigen::AngleAxisd aa(dq);
   error.tail<3>() = aa.axis() * aa.angle();
 
+  // The perturbation in \f$ R_{WB} \f$ is defined as \f$ R_{WB} = exp(\theta) \hat{R}_{WB} \f$.
+  // The perturbation in \f$ p_{WB} \f$ is defined as \f$ p_{WB} = \delta p + \hat{p}_{WB} \f$.
   if (jacobians != NULL) {
     Eigen::Matrix3d invR1 = q1.inverse().toRotationMatrix();
     Eigen::Vector3d eRot = error.tail<3>();

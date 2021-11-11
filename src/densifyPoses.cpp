@@ -23,6 +23,11 @@ using ceres::Problem;
 using ceres::Solve;
 using ceres::Solver;
 
+/**
+ * @brief loadcsv
+ * @param datafile
+ * @param res [time(sec) tx ty tz qx qy qz qw] list
+ */
 void loadcsv(const std::string &datafile,
              std::vector<std::vector<double>> &res) {
   std::ifstream infile(datafile);
@@ -40,7 +45,13 @@ void loadcsv(const std::string &datafile,
   infile.close();
 }
 
-void savecsv(std::string outfile, std::vector<std::vector<double>> &data,
+/**
+ * @brief savecsv
+ * @param outfile
+ * @param data [time(sec) tx ty tz qx qy qz qw] list
+ * @param fileHead
+ */
+void savecsv(std::string outfile, const std::vector<std::vector<double>> &data,
              std::string fileHead) {
   std::ofstream ofs(outfile, std::ofstream::out);
   ofs << fileHead << std::endl;
@@ -58,38 +69,24 @@ void densifyPoses(const std::string &framePoseTxt,
                   const std::string &keyframePoseTxt) {
   std::cout << "Frame pose file " << framePoseTxt << "\nKeyframe pose file "
             << keyframePoseTxt << "\n";
-  // 1.1 load keyframe poses from test/data/dataset-corridor1_512_16_poses.txt,
-  // refer to loadCsvData in SimDataInterface.cpp of repo swift_vio.
   std::vector<std::vector<double>> kf_poses, f_poses;
-  loadcsv(keyframePoseTxt, kf_poses);
-  // 1.2 load frame poses from test/data/dataset-corridor1_512_16_kfposes.txt,
-  // refer to loadCsvData in SimDataInterface.cpp of repo swift_vio.
+  // Note that frames includes all keyframes.
   loadcsv(framePoseTxt, f_poses);
+  loadcsv(keyframePoseTxt, kf_poses);
 
-  // 2.1 states: SE3 poses for all frames. Frames includes all keyframes.
-  // These states are represented by G2oVertexSE3
-  // SET  VERTICES
   size_t count = 0;
   std::vector<int> kf_indices;
   const int SIZE_POSE = 7;
-
   std::vector<Eigen::Matrix<double, 7, 1>,
               Eigen::aligned_allocator<Eigen::Matrix<double, 7, 1>>>
       estimated_poses;
 
+  // 2.1 initialization of SE3 poses: for keyframes, use the values loaded
+  // from the file, for frames, initialize their poses relative to the nearest
+  // keyframe using relative motion.
   for (size_t i = 0u; i < f_poses.size(); i++) {
-    // 2.1.1 initialization of SE3 poses: for keyframes, use the values loaded
-    // from the file, for frames, initialize their poses relative to the nearest
-    // keyframe using relative motion.
     if (count < kf_poses.size() && f_poses[i][0] == kf_poses[count][0]) {
-      // v->setFixed(true);
       kf_indices.push_back(i);
-      Eigen::Quaterniond refKeyframeQuat(kf_poses[count][7], kf_poses[count][4],
-                                         kf_poses[count][5],
-                                         kf_poses[count][6]);
-      Eigen::Vector3d refKeyframeTrans(kf_poses[count][1], kf_poses[count][2],
-                                       kf_poses[count][3]);
-
       Eigen::Map<Eigen::Matrix<double, 7, 1>> pose(&kf_poses[count][1]);
       estimated_poses.push_back(pose);
       count++;
@@ -113,7 +110,7 @@ void densifyPoses(const std::string &framePoseTxt,
                               local_parameterization);
   }
 
-  // 2.2 observations: // SET EDGES
+  // 2.2 observations:
   // SE3 pose priors for keyframes
   for (size_t i = 0u; i < kf_poses.size(); i++) {
     Eigen::Map<Eigen::Matrix<double, 7, 1>> pose(&kf_poses[i][1]);
@@ -144,16 +141,13 @@ void densifyPoses(const std::string &framePoseTxt,
                              estimated_poses[i + 1].data());
   }
 
-  // Run the solver!
   Solver::Options options;
   options.minimizer_progress_to_stdout = true;
   Solver::Summary summary;
   Solve(options, &problem, &summary);
 
-  // 3. save the refined frame poses to a csv file with the same format as the
-  // poses.txt.
+  // 3. save the refined frame poses to a csv file.
   for (size_t i = 0u; i < f_poses.size(); i++) {
-
     Eigen::Map<Eigen::Quaterniond> q(estimated_poses[i].data() + 3);
     Eigen::Map<Eigen::Vector3d> t(estimated_poses[i].data());
     f_poses[i][1] = t(0);
@@ -168,7 +162,7 @@ void densifyPoses(const std::string &framePoseTxt,
 
   std::string outfile = framePoseTxt.substr(0, pos) + "/dense_poses.txt";
 
-  LOG(INFO) << "Saving densified poses to " << outfile;
+  std::cout << "Saving densified poses to " << outfile << std::endl;
   std::string fileHead = "# timestamp tx ty tz qx qy qz qw";
   savecsv(outfile, f_poses, fileHead);
 }

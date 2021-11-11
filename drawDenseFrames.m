@@ -17,4 +17,8 @@ legend('frames', 'keyframes', 'dense frames');
 
 % figure;
 % drawColumnsInMultipleFiles(datafiles, {'frames', 'keyframes', 'dense frames'}, ...
-%    {'x', 'y', 'z'}, 2:4, 0);
+%     {'x', 'y', 'z'}, 2:4, 0);
+
+% figure;
+% drawColumnsInMultipleFiles(datafiles, {'frames', 'keyframes', 'dense frames'}, ...
+%     {'qx', 'qy', 'qz'}, 5:7, 0);
