@@ -66,7 +66,8 @@ void savecsv(std::string outfile, const std::vector<std::vector<double>> &data,
 }
 
 void densifyPoses(const std::string &framePoseTxt,
-                  const std::string &keyframePoseTxt) {
+                  const std::string &keyframePoseTxt,
+                  const std::string &outfile) {
   std::cout << "Frame pose file " << framePoseTxt << "\nKeyframe pose file "
             << keyframePoseTxt << "\n";
   std::vector<std::vector<double>> kf_poses, f_poses;
@@ -84,8 +85,9 @@ void densifyPoses(const std::string &framePoseTxt,
   // 2.1 initialization of SE3 poses: for keyframes, use the values loaded
   // from the file, for frames, initialize their poses relative to the nearest
   // keyframe using relative motion.
+  const double timetolerance = 5e-3;
   for (size_t i = 0u; i < f_poses.size(); i++) {
-    if (count < kf_poses.size() && f_poses[i][0] == kf_poses[count][0]) {
+    if (count < kf_poses.size() && std::fabs(f_poses[i][0] - kf_poses[count][0]) < timetolerance) {
       kf_indices.push_back(i);
       Eigen::Map<Eigen::Matrix<double, 7, 1>> pose(&kf_poses[count][1]);
       estimated_poses.push_back(pose);
@@ -97,7 +99,7 @@ void densifyPoses(const std::string &framePoseTxt,
   }
   CHECK_EQ(kf_indices.size(), kf_poses.size())
       << "Found keyframes in frames " << count << " and keyframe poses "
-      << kf_poses.size() << ".";
+      << kf_poses.size() << ". If they do not agree, try to increase time diff toleranace.";
   CHECK_EQ(f_poses.size(), estimated_poses.size())
       << "Frame poses " << f_poses.size() << " and initial poses "
       << estimated_poses.size() << ".";
@@ -158,9 +160,6 @@ void densifyPoses(const std::string &framePoseTxt,
     f_poses[i][6] = q.z();
     f_poses[i][7] = q.w();
   }
-  size_t pos = framePoseTxt.find_last_of("/\\");
-
-  std::string outfile = framePoseTxt.substr(0, pos) + "/dense_poses.txt";
 
   std::cout << "Saving densified poses to " << outfile << std::endl;
   std::string fileHead = "# timestamp tx ty tz qx qy qz qw";
@@ -174,6 +173,15 @@ int main(int argc, char *argv[]) {
                  "time[sec] tx ty tz qx qy qz qw\n";
     return -1;
   }
-  densifyPoses(argv[1], argv[2]);
+  std::string framePoseTxt = argv[1];
+  std::string keyframePoseTxt = argv[2];
+  size_t pos = framePoseTxt.find_last_of("/\\");
+  std::string outfile = framePoseTxt.substr(0, pos) + "/dense_poses.txt";
+
+  if (argc > 3) {
+    outfile = argv[3];
+  }
+
+  densifyPoses(framePoseTxt, keyframePoseTxt, outfile);
   return 0;
 }
