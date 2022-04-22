@@ -1,6 +1,12 @@
 # densify_poses
+Given consecutive poses obtained by a drifting odometer,
+and sparse key poses obtained by an optimization backend,
+densify the sparse poses with the dense consecutive odometry poses,
+by using a pose graph optimization on SE3.
+The output poses will use the world frame of the sparse key poses.
+The original world frame of the dense odometry poses does not affect the final trajectory.
 
-Depends on ceres solver which is wrapped in ceres_catkin.
+This program depends on ceres solver which is wrapped in ceres_catkin.
 
 # Build
 
@@ -16,5 +22,12 @@ wstool update -j 8
 cd ..
 catkin build densify_poses -DCMAKE_BUILD_TYPE=Release -j4
 
+```
+
+# Run
+```
+densify_exe=/media/jhuai/docker/densify_poses_ws/devel/lib/densify_poses/densifyPoses
+cd $OUTPUTDIR
+$densify_exe $OUTPUTDIR/trajectory.txt $OUTPUTDIR/keyframeTrajectory.txt
 ```
 
