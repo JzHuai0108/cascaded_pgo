@@ -3,6 +3,7 @@
 // densify the sparse poses with the dense consecutive odometry poses,
 // by using a pose graph optimization on SE3.
 
+#include <cstdlib>
 #include <fstream>
 #include <iomanip> // std::setprecision
 #include <iostream>
@@ -29,7 +30,7 @@ using ceres::Solver;
  * @param res [time(sec) tx ty tz qx qy qz qw] list
  */
 void loadcsv(const std::string &datafile,
-             std::vector<std::vector<double>> &res) {
+             std::vector<std::vector<double>> &res, char delim=' ') {
   std::ifstream infile(datafile);
   std::string line;
   std::getline(infile, line);
@@ -37,8 +38,12 @@ void loadcsv(const std::string &datafile,
     std::istringstream sin(line);
     double d;
     std::vector<double> temp;
+    char tempdelim;
     while (sin >> d) {
       temp.push_back(d);
+      if (delim != ' ') {
+        sin >> tempdelim;
+      }
     }
     res.push_back(temp);
   }
@@ -65,44 +70,93 @@ void savecsv(std::string outfile, const std::vector<std::vector<double>> &data,
   ofs.close();
 }
 
+struct AssociatedPose {
+  size_t kfId;
+  size_t fId;
+  double timeDiff;
+
+  AssociatedPose(size_t _kfId, size_t _fId, double _timeDiff) : kfId(_kfId), fId(_fId), timeDiff(_timeDiff) {}
+
+};
+
+/**
+ * @brief associatePoses
+ * @param f_poses
+ * @param kf_poses
+ * @param kf_indices the index of the frame pose closest in time to the keyframe pose.
+ */
+void associatePoses(const std::vector<std::vector<double>> &f_poses,
+                    const std::vector<std::vector<double>> &kf_poses,
+                    double timetolerance,
+                    std::vector<AssociatedPose> *kf_indices) {
+  kf_indices->clear();
+  size_t lastUsedFrameId = 0;
+  kf_indices->reserve(kf_poses.size());
+  for (size_t i = 0; i < kf_poses.size(); ++i) {
+     double kf_time = kf_poses[i][0];
+     double minTimeDiff = 1000;
+     size_t minId = 0;
+     size_t j = lastUsedFrameId;
+
+     for (; j < f_poses.size(); ++j) {
+        double diff = std::fabs(f_poses[j][0] - kf_time);
+        if (diff < minTimeDiff) {
+          minTimeDiff = diff;
+          minId = j;
+        }
+     }
+     if (minTimeDiff < timetolerance) {
+       kf_indices->emplace_back(i, minId, minTimeDiff);
+       lastUsedFrameId = minId;
+     }
+  }
+
+  // check
+  for (const auto &ap : *kf_indices) {
+    CHECK_LT(ap.timeDiff, timetolerance);
+    CHECK_LT(ap.fId, f_poses.size());
+  }
+
+  LOG(INFO) << "Associated #keyframe poses " << kf_indices->size()
+            << " to frames out of total #keyframe poses " << kf_poses.size()
+            << ". If the number of associations is too few, try to increase "
+               "time diff "
+               "toleranace (current value "
+            << timetolerance << " sec).";
+}
+
 void densifyPoses(const std::string &framePoseTxt,
                   const std::string &keyframePoseTxt,
-                  const std::string &outfile) {
+                  const std::string &outfile, double timetolerance) {
   std::cout << "Frame pose file " << framePoseTxt << "\nKeyframe pose file "
             << keyframePoseTxt << "\n";
   std::vector<std::vector<double>> kf_poses, f_poses;
   // Note that frames includes all keyframes.
-  loadcsv(framePoseTxt, f_poses);
+//  loadcsv(framePoseTxt, f_poses, ',');
+  loadcsv(framePoseTxt, f_poses, ' ');
+  CHECK_GT(f_poses.size(), 0) << "No. pose loaded from " << framePoseTxt << ".";
+  CHECK_GE(f_poses.front().size(), 8)
+      << "Too few columns (" << f_poses.front().size() << ") loaded from "
+      << framePoseTxt
+      << ". Ensure that the lines of the file agrees with TUM format.";
   loadcsv(keyframePoseTxt, kf_poses);
 
-  size_t count = 0;
-  std::vector<int> kf_indices;
   const int SIZE_POSE = 7;
   std::vector<Eigen::Matrix<double, 7, 1>,
               Eigen::aligned_allocator<Eigen::Matrix<double, 7, 1>>>
       estimated_poses;
+  estimated_poses.reserve(f_poses.size());
 
   // 2.1 initialization of SE3 poses: for keyframes, use the values loaded
   // from the file, for frames, initialize their poses relative to the nearest
   // keyframe using relative motion.
-  const double timetolerance = 5e-3;
   for (size_t i = 0u; i < f_poses.size(); i++) {
-    if (count < kf_poses.size() && std::fabs(f_poses[i][0] - kf_poses[count][0]) < timetolerance) {
-      kf_indices.push_back(i);
-      Eigen::Map<Eigen::Matrix<double, 7, 1>> pose(&kf_poses[count][1]);
-      estimated_poses.push_back(pose);
-      count++;
-    } else {
-      Eigen::Map<Eigen::Matrix<double, 7, 1>> pose(&f_poses[i][1]);
-      estimated_poses.push_back(pose);
-    }
+    Eigen::Map<const Eigen::Matrix<double, 7, 1>> pose(&f_poses[i][1]);
+    estimated_poses.push_back(pose);
   }
-  CHECK_EQ(kf_indices.size(), kf_poses.size())
-      << "Found keyframes in frames " << count << " and keyframe poses "
-      << kf_poses.size() << ". If they do not agree, try to increase time diff toleranace.";
-  CHECK_EQ(f_poses.size(), estimated_poses.size())
-      << "Frame poses " << f_poses.size() << " and initial poses "
-      << estimated_poses.size() << ".";
+
+  std::vector<AssociatedPose> kf_indices;
+  associatePoses(f_poses, kf_poses, timetolerance, &kf_indices);
 
   Problem problem;
   ceres::LocalParameterization *local_parameterization =
@@ -114,12 +168,12 @@ void densifyPoses(const std::string &framePoseTxt,
 
   // 2.2 observations:
   // SE3 pose priors for keyframes
-  for (size_t i = 0u; i < kf_poses.size(); i++) {
-    Eigen::Map<Eigen::Matrix<double, 7, 1>> pose(&kf_poses[i][1]);
+  for (size_t i = 0u; i < kf_indices.size(); i++) {
+    Eigen::Map<Eigen::Matrix<double, 7, 1>> pose(&kf_poses[kf_indices[i].kfId][1]);
 
     CostFunction *cost_function = new EdgeSE3Prior(pose);
     problem.AddResidualBlock(cost_function, nullptr,
-                             estimated_poses[kf_indices[i]].data());
+                             estimated_poses[kf_indices[i].fId].data());
   }
 
   // SE3 relative motion constraints for consecutive frames
@@ -160,10 +214,9 @@ void densifyPoses(const std::string &framePoseTxt,
     f_poses[i][6] = q.z();
     f_poses[i][7] = q.w();
   }
-
-  std::cout << "Saving densified poses to " << outfile << std::endl;
   std::string fileHead = "# timestamp tx ty tz qx qy qz qw";
   savecsv(outfile, f_poses, fileHead);
+  std::cout << "Saved densified poses to " << outfile << std::endl;
 }
 
 int main(int argc, char *argv[]) {
@@ -181,7 +234,10 @@ int main(int argc, char *argv[]) {
   if (argc > 3) {
     outfile = argv[3];
   }
-
-  densifyPoses(framePoseTxt, keyframePoseTxt, outfile);
+  double timetolerance = 2e-3;
+  if (argc > 4) {
+    timetolerance = std::atof(argv[4]);
+  }
+  densifyPoses(framePoseTxt, keyframePoseTxt, outfile, timetolerance);
   return 0;
 }
