@@ -20,8 +20,9 @@ SET(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS} -O3 -fsee -fomit-frame-pointer -
 
 # Add plain cmake packages 
 FIND_PACKAGE(Eigen REQUIRED)
+find_package(Ceres 2.0 REQUIRED)
 
-FIND_PACKAGE(catkin REQUIRED COMPONENTS roscpp cmake_modules ceres_catkin)
+FIND_PACKAGE(catkin REQUIRED COMPONENTS roscpp cmake_modules)
 catkin_package(
   DEPENDS Eigen
   CATKIN_DEPENDS roscpp
@@ -35,6 +36,10 @@ INCLUDE_DIRECTORIES(
   ${catkin_INCLUDE_DIRS}
 )
 
-ADD_EXECUTABLE(densifyPoses src/densifyPoses.cpp src/hamilton_quaternion.cpp src/pose_local_parameterization.cpp src/pose_factors.cpp)
-TARGET_LINK_LIBRARIES(densifyPoses PUBLIC ${catkin_LIBRARIES} glog)
+ADD_EXECUTABLE(densifyPoses
+  src/densifyPoses.cpp
+  src/hamilton_quaternion.cpp
+  src/pose_local_parameterization.cpp
+  src/pose_factors.cpp)
 
+TARGET_LINK_LIBRARIES(densifyPoses PUBLIC ${catkin_LIBRARIES} ${CERES_LIBRARIES} glog)

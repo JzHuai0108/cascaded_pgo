@@ -6,9 +6,21 @@ by using a pose graph optimization on SE3.
 The output poses will use the world frame of the sparse key poses.
 The original world frame of the dense odometry poses does not affect the final trajectory.
 
-This program depends on ceres solver which is wrapped in ceres_catkin.
-
 # Build
+This program depends on ceres solver.
+## ceres solver
+```
+cd /home/$USER/Documents/slam_src
+git clone --recursive https://github.com/ceres-solver/ceres-solver.git
+cd ceres-solver
+git checkout 2.1.0
+mkdir -p build && cd build
+cmake .. -DCMAKE_INSTALL_PREFIX=/home/$USER/Documents/slam_devel -DBUILD_SHARED_LIBS=ON \
+    -DCMAKE_BUILD_TYPE:STRING=Release -DBUILD_EXAMPLES:BOOL=OFF -DBUILD_TESTING:BOOL=OFF \
+    -DGLOG_INCLUDE_DIR_HINTS=/usr/include -DGLOG_LIBRARY_DIR_HINTS=/usr/lib
+
+make install
+```
 
 ## With ROS
 ```
@@ -20,7 +32,9 @@ wstool init
 wstool merge densify_poses/dependencies.rosinstall
 wstool update -j 8
 cd ..
-catkin build densify_poses -DCMAKE_BUILD_TYPE=Release -j4
+catkin build densify_poses -DCMAKE_BUILD_TYPE=Release -j4 -DPYTHON_EXECUTABLE=/usr/bin/python3 \
+  -DCeres_DIR=/home/$USER/Documents/slam_devel/lib/cmake/Ceres \
+  -DGLOG_INCLUDE_DIR_HINTS=/usr/include -DGLOG_LIBRARY_DIR_HINTS=/usr/lib
 
 ```
 
