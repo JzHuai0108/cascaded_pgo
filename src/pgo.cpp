@@ -91,10 +91,72 @@ private:
     Eigen::Vector3d sigma_p_;
 };
 
-size_t load_poses(std::vector<okvis::Time> &times, std::vector<Eigen::Matrix<double, 7, 1>, Eigen::aligned_allocator<Eigen::Matrix<double, 7, 1>>> &poses, okvis::Duration cull_end_secs = 8) {
+size_t load_poses(const std::string &posefile,
+    std::vector<okvis::Time> &times, std::vector<Eigen::Matrix<double, 7, 1>, Eigen::aligned_allocator<Eigen::Matrix<double, 7, 1>>> &poses, 
+    okvis::Duration cull_end_secs = 8) {
     // load poses from file
-    // 
+    std::ofstream stream(posefile);
+    if (!stream.is_open()) {
+        std::cerr << "Failed to open file " << posefile << std::endl;
+        return 1;
+    }
+    while (!stream.eof()) {
+        std::string line;
+        std::getline(stream, line);
+        std::istringstream iss(line);
+        std::string time_str;
+        iss >> time_str;
+        if (time_str.empty()) {
+            break;
+        }
+        // keep the time precision to nanoseconds
+        std::string::size_type pos = time_str.find('.');
+        uint32_t sec = std::stoul(time_str.substr(0, pos));
+        uint32_t nsec = std::stoul(time_str.substr(pos + 1));
+        okvis::Time time(sec, nsec); // TODO: yiwen, copy the okvis time implementation from https://github.com/ethz-asl/okvis/tree/master/okvis_time
+        // yiwen: try to keep these okvis time file intact, i.e., minimize the changes to these external files.
+
+        Eigen::Matrix<double, 7, 1> pose;
+        for (size_t i = 0; i < 7; ++i) {
+            iss >> pose[i];
+        }
+        times.push_back(time);
+        poses.push_back(pose);
+    }
+
     return 0;
+}
+
+std::vector<okvis::Time> correct_back_times(std::vector<okvis::Time> &back_times, const okvis::Time &max_bag_time) {
+    std::vector<okvis::Time> actual_back_times;
+    actual_back_times.reserve(back_times.size());
+    for (size_t i = 0; i < back_times.size(); ++i) {
+        actual_back_times.push_back(max_bag_time - back_times[i] + max_bag_time);  
+    }
+}
+
+void load_times(const std::string &timefile, okvis::Time &max_bag_time) {
+    // timefile format:
+    // first line is max_bag_time,
+    // second line is max_bag_time * 2
+    std::ifstream stream(timefile);
+    if (!stream.is_open()) {
+        std::cerr << "Failed to open file " << timefile << std::endl;
+        return 1;
+    }
+    std::string line;
+    std::getline(stream, line);
+    std::istringstream iss(line);
+    std::string time_str;
+    iss >> time_str;
+    if (time_str.empty()) {
+        return 1;
+    }
+    // keep the time precision to nanoseconds
+    std::string::size_type pos = time_str.find('.');
+    uint32_t sec = std::stoul(time_str.substr(0, pos));
+    uint32_t nsec = std::stoul(time_str.substr(pos + 1));
+    max_bag_time = okvis::Time(sec, nsec);
 }
 
 int main(int argc, char **argv) {
@@ -106,27 +168,29 @@ int main(int argc, char **argv) {
 
     std::vector<okvis::Time> odometry_times;
     std::vector<Eigen::Matrix<double, 7, 1>, Eigen::aligned_allocator<Eigen::Matrix<double, 7, 1>>> odometry_poses;
-    
+
     std::map<okvis::Time, Eigen::Matrix<double, 7, 1>, std::less<okvis::Time>, 
         Eigen::aligned_allocator<std::pair<const okvis::Time, Eigen::Matrix<double, 7, 1>>>> optimized_poses;
 
-    load_poses(front_times, front_poses);
-    load_poses(back_times, back_poses);
-    load_poses(odometry_times, odometry_poses);
-    
+    load_poses(front_loc_file, front_times, front_poses);
+    load_poses(back_loc_file, back_times, back_poses);
+    load_poses(odometry_file, odometry_times, odometry_poses);
+    okvis::Time max_bag_time;
+    load_times(back_time_file, max_bag_time);
+
     // put odometry poses into optimized_poses
     for (size_t i = 0; i < odometry_times.size(); ++i) {
         optimized_poses[odometry_times[i]] = odometry_poses[i];
     }
 
-    correct_back_times(back_times);
+    std::vector<okvis::Time> actual_back_times = correct_back_times(back_times, max_bag_time);
 
     // rotation optimizer
     ceres::Problem rotation_optimizer;
     // set parameter block parameterization
-    ceres::LocalParameterization *quaternion_parameterization = new ceres::QuaternionParameterization();
+    ceres::Manifold *rotmanifold = new RotationManifold();
     for (auto &pose : optimized_poses) {
-        rotation_optimizer.AddParameterBlock(pose.second.data() + 3, 4, quaternion_parameterization);
+        rotation_optimizer.AddParameterBlock(pose.second.data() + 3, 4, rotmanifold);
     }
 
     for (size_t i = 0; i < front_times.size(); ++i) {
