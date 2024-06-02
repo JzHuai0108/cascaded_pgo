@@ -1,8 +1,7 @@
 #include <ceres/manifold.h>
+#include "pose_manifold.h"
+#include "hamilton_quaternion.h"
 
-#include <bsplines_ceres/pose_manifold.h>
-
-namespace bsplines {
 namespace ceres {
 /**
  * The manifold used by ceres solver for SO3.
@@ -78,7 +77,7 @@ public:
     S(1, 1) = 0.5;
     S(2, 2) = 0.5;
     Eigen::Map<const Eigen::Quaterniond> q0(x);
-    Jp = oplusQuat(q0) * S;
+    Jp = ceres::oplusQuat(q0) * S;
     return true;
   }
 
@@ -106,4 +105,3 @@ public:
   int TangentSize() const { return 3; }
 };
 }  // namespace ceres
-}  // namespace bsplines

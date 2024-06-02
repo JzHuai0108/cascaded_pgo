@@ -1,4 +1,4 @@
-# densify_poses
+# cascaded_pgo
 Given consecutive poses obtained by a drifting odometer,
 and sparse key poses obtained by an optimization backend,
 densify the sparse poses with the dense consecutive odometry poses,

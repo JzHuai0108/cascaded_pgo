@@ -14,10 +14,10 @@ bool EdgeSE3::Evaluate(double const *const *parameters, double *residuals,
 
   Eigen::Map<Eigen::Matrix<double, 6, 1>> error(residuals);
 
-  error.head<3>() = p12 - p_ab_;
+  error.head<3>() = (p12 - p_ab_).cwiseQuotient(sigmaPQ_.head<3>());
   Eigen::Quaterniond dq = q12 * q_ab_.inverse();
   Eigen::AngleAxisd aa(dq);
-  error.tail<3>() = aa.axis() * aa.angle();
+  error.tail<3>() = (aa.axis() * aa.angle()).cwiseQuotient(sigmaPQ_.tail<3>());
 
   // The perturbation in \f$ R_{WB} \f$ is defined as \f$ R_{WB} = exp(\theta) \hat{R}_{WB} \f$.
   // The perturbation in \f$ p_{WB} \f$ is defined as \f$ p_{WB} = \delta p + \hat{p}_{WB} \f$.
@@ -26,19 +26,21 @@ bool EdgeSE3::Evaluate(double const *const *parameters, double *residuals,
     Eigen::Vector3d eRot = error.tail<3>();
     Eigen::Matrix3d invLeftJacobian = hamilton::logDiffMat<double>(eRot);
     Eigen::Matrix3d product = invLeftJacobian * invR1;
+    Eigen::Matrix3d invSigmaP = sigmaPQ_.head<3>().asDiagonal().inverse();
+    Eigen::Matrix3d invSigmaQ = sigmaPQ_.tail<3>().asDiagonal().inverse();
     if (jacobians[0] != NULL) {
       Eigen::Map<Eigen::Matrix<double, 6, 7, Eigen::RowMajor>> J0(jacobians[0]);
       J0.setZero();
-      J0.block<3, 3>(0, 0) = -invR1;
+      J0.block<3, 3>(0, 0) = -invSigmaP * invR1;
       Eigen::Vector3d dp = p2 - p1;
       J0.block<3, 3>(0, 3) = invR1 * hamilton::crossMx(dp);
-      J0.block<3, 3>(3, 3) = -product;
+      J0.block<3, 3>(3, 3) = -invSigmaQ * product;
     }
     if (jacobians[1] != NULL) {
       Eigen::Map<Eigen::Matrix<double, 6, 7, Eigen::RowMajor>> J1(jacobians[1]);
       J1.setZero();
-      J1.block<3, 3>(0, 0) = invR1;
-      J1.block<3, 3>(3, 3) = product;
+      J1.block<3, 3>(0, 0) = invSigmaP * invR1;
+      J1.block<3, 3>(3, 3) = invSigmaQ * product;
     }
   }
   return true;
@@ -51,17 +53,22 @@ bool EdgeSE3Prior::Evaluate(double const *const *parameters, double *residuals,
   Eigen::Map<const Eigen::Quaterniond> q(parameters[0] + 3);
 
   Eigen::Map<Eigen::Matrix<double, 6, 1>> error(residuals);
-  error.head<3>() = p - p_;
+  Eigen::Matrix3d invSigmaP = sigmaPQ_.head<3>().asDiagonal().inverse();
+  Eigen::Matrix3d invSigmaQ = sigmaPQ_.tail<3>().asDiagonal().inverse();
+  error.head<3>() = (p - p_).cwiseQuotient(sigmaPQ_.head<3>());
   Eigen::Quaterniond dq = q * q_.inverse();
   Eigen::AngleAxisd aa(dq);
-  error.tail<3>() = aa.axis() * aa.angle();
+  error.tail<3>() = (aa.axis() * aa.angle()).cwiseQuotient(sigmaPQ_.tail<3>());
 
   if (jacobians != NULL) {
+    Eigen::Matrix3d invSigmaP = sigmaPQ_.head<3>().asDiagonal().inverse();
+    Eigen::Matrix3d invSigmaQ = sigmaPQ_.tail<3>().asDiagonal().inverse();
     if (jacobians[0] != NULL) {
       Eigen::Map<Eigen::Matrix<double, 6, 7, Eigen::RowMajor>> J0(jacobians[0]);
       J0.setIdentity();
+      J0.block<3, 3>(0, 0) = invSigmaP;
       Eigen::Vector3d eRot = error.tail<3>();
-      J0.block<3, 3>(3, 3) = hamilton::logDiffMat<double>(eRot);
+      J0.block<3, 3>(3, 3) = invSigmaQ * hamilton::logDiffMat<double>(eRot);
     }
   }
   return true;

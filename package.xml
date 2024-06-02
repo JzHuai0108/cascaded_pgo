@@ -1,8 +1,8 @@
 <?xml version="1.0"?>
 <package>
-  <name>densify_poses</name>
+  <name>cascaded_pgo</name>
   <version>0.0.0</version>
-  <description>The densify_poses package</description>
+  <description>The cascaded_pgo package</description>
 
   <!-- One maintainer tag required, multiple allowed, one person per tag --> 
   <!-- Example:  -->
