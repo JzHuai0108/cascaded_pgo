@@ -27,6 +27,8 @@
 #include "pose_factors.h"
 #include <gflags/gflags.h>
 
+DEFINE_double(cull_begin_secs, 1.5, "Cull the poses at the beginning of the front loc session and the backward loc session to avoid the jittering part");
+DEFINE_double(cull_end_secs, 8.0, "Cull the poses at the end of the front loc session and the backward loc session to avoid the drift part");
 DEFINE_int32(near_time_tol, 100000, "Tolerance in nanoseconds for finding the nearest pose in time");
 DEFINE_double(trans_prior_sigma, 0.1, "Prior sigma for translation");
 DEFINE_double(rot_prior_sigma, 0.05, "Prior sigma for rotation");
@@ -44,7 +46,7 @@ public:
     Eigen::Map<const Eigen::Quaternion<T>> q_map(q);
 
     Eigen::Quaternion<T> q_conj = q_.cast<T>().inverse();
-    Eigen::Quaternion<T> q_diff = q_map * q_conj;
+    Eigen::Quaternion<T> q_diff = q_conj * q_map;
 
     Eigen::AngleAxis<T> aa(q_diff);
     Eigen::Matrix<T, 3, 1> angle_axis = aa.angle() * aa.axis();
@@ -74,7 +76,7 @@ public:
     Eigen::Map<const Eigen::Quaternion<T>> q2_map(q2);
 
     Eigen::Quaternion<T> q1_inv = q1_map.conjugate();
-    Eigen::Quaternion<T> q_diff = q1_inv * q2_map * b1_q_b2_.template cast<T>();
+    Eigen::Quaternion<T> q_diff = q1_inv * q2_map * b1_q_b2_.template cast<T>().conjugate();
 
     Eigen::AngleAxis<T> aa(q_diff);
     Eigen::Matrix<T, 3, 1> angle_axis = aa.angle() * aa.axis();
@@ -135,8 +137,8 @@ private:
 size_t load_poses(const std::string &posefile,
     std::vector<okvis::Time> &times, 
     std::vector<Eigen::Matrix<double, 7, 1>, Eigen::aligned_allocator<Eigen::Matrix<double, 7, 1>>> &poses,
+    okvis::Duration cull_begin_secs = okvis::Duration(0),
     okvis::Duration cull_end_secs = okvis::Duration(0)) {
-    // load poses from file
     std::ifstream stream(posefile);
     if (!stream.is_open()) {
         std::cerr << "Failed to open file " << posefile << std::endl;
@@ -177,14 +179,21 @@ size_t load_poses(const std::string &posefile,
         times.push_back(time);
         poses.push_back(pose);
     }
-
+    // cull the end
     okvis::Time end_time = times.back();
     okvis::Time cull_end_time = end_time - cull_end_secs;
-    while (!times.empty() && times.back() > cull_end_time) {
-        times.pop_back();
-        poses.pop_back();
-    }
+    auto eit = std::lower_bound(times.begin(), times.end(), cull_end_time);
+    int m = times.end() - eit;
+    times.erase(eit, times.end());
+    poses.erase(poses.end() - m, poses.end());
 
+    // cull the begin
+    okvis::Time begin_time = times.front();
+    okvis::Time cull_begin_time = begin_time + cull_begin_secs;
+    auto it = std::lower_bound(times.begin(), times.end(), cull_begin_time);
+    int n = it - times.begin();
+    times.erase(times.begin(), it);
+    poses.erase(poses.begin(), poses.begin() + n);
     return 0;
 }
 
@@ -327,9 +336,10 @@ public:
 
     CascadedPgo(const std::string &front_loc_file, const std::string &back_loc_file, const std::string &odometry_file,
             const std::string &back_time_file) {
-        okvis::Duration cull_end_secs(8);
-        load_poses(front_loc_file, front_times, front_poses, cull_end_secs);
-        load_poses(back_loc_file, back_times, back_poses, cull_end_secs);
+        okvis::Duration cull_end_secs(FLAGS_cull_end_secs);
+        okvis::Duration cull_begin_secs(FLAGS_cull_begin_secs);
+        load_poses(front_loc_file, front_times, front_poses, cull_begin_secs, cull_end_secs);
+        load_poses(back_loc_file, back_times, back_poses, cull_begin_secs, cull_end_secs);
 
         load_poses(odometry_file, odometry_times, odometry_poses);
         okvis::Time max_bag_time;
@@ -378,7 +388,7 @@ public:
     }
 
     void OptimizeRotation() {
-        // Warn: The optimized rotations are problematic.
+        std::cout << "Optimizing rotation..." << std::endl;
         ceres::Problem rotation_optimizer;
         ceres::Manifold *rotmanifold = new ceres::RotationManifold();
         for (auto &pose : optimized_poses) {
@@ -432,6 +442,7 @@ public:
     }
 
     void OptimizeTranslation() {
+        std::cout << "Optimizing translation..." << std::endl;
         ceres::Problem translation_optimizer;
         // add prior translations from the front and the back
         for (size_t i = 0; i < front_times.size(); ++i) {
@@ -487,6 +498,7 @@ public:
     }
 
     void OptimizePoseGraph() {
+        std::cout << "Optimizing 6DoF pose graph..." << std::endl;
         ceres::Problem pose_graph_optimizer;
         ceres::Manifold *pose_manifold = new ceres::PoseManifoldSimplified();
 
@@ -560,12 +572,16 @@ int main(int argc, char **argv) {
     std::string back_loc_folder = back_loc_file.substr(0, back_loc_file.find_last_of("/"));
     std::string back_time_file = back_loc_folder + "/bag_maxtime.txt";
     std::string output_path = argv[4];
-
+    std::cout << "Odometry: " << odometry_file << std::endl;
+    std::cout << "Front loc: " << front_loc_file << std::endl;
+    std::cout << "Back loc: " << back_loc_file << std::endl;
+    std::cout << "Back time: " << back_time_file << std::endl;
+    std::cout << "Output path: " << output_path << std::endl;
     CascadedPgo cpgo(front_loc_file, back_loc_file, odometry_file, back_time_file);
     cpgo.InitializePoses();
     cpgo.saveResults(output_path + "/initial_poses.txt");
-    // cpgo.OptimizeRotation();
-    // cpgo.saveResults(data_path + "/rotated_poses.txt");
+    cpgo.OptimizeRotation();
+    cpgo.saveResults(output_path + "/rotated_poses.txt");
     cpgo.OptimizeTranslation();
     cpgo.saveResults(output_path + "/translated_poses.txt");
     cpgo.OptimizePoseGraph();
