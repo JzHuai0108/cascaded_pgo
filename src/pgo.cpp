@@ -5,10 +5,10 @@
  * and the relative poses between frames from an odometry method,
  * optimize the trajectory to minimize the error in the constraints.
  * This is done in several steps:
- * 1. First only optimize the rotations with a ceres problem;
- * 2. Second only optimize the translations with a ceres problem;
- * 3. Third optimize both rotation and translations with a ceres problem.
+ * First only optimize the translations with a ceres problem;
+ * Second optimize both rotation and translations with a ceres problem.
  */
+
 #include <pose_factors.h>
 #include <ceres/problem.h>
 #include <fstream>
@@ -27,8 +27,11 @@
 #include "pose_factors.h"
 #include <gflags/gflags.h>
 
-// DEFINE_string(output_path, "", "output path");
-// DEFINE_string(data_path, "", "data_path");
+DEFINE_int32(near_time_tol, 100000, "Tolerance in nanoseconds for finding the nearest pose in time");
+DEFINE_double(trans_prior_sigma, 0.1, "Prior sigma for translation");
+DEFINE_double(rot_prior_sigma, 0.05, "Prior sigma for rotation");
+DEFINE_double(relative_trans_sigma, 0.01, "Relative translation sigma in about 0.1 sec");
+DEFINE_double(relative_rot_sigma, 0.005, "Relative rotation sigma in about 0.1 sec");
 
 class SO3Prior {
 public:
@@ -383,25 +386,25 @@ public:
         }
 
         for (size_t i = 0; i < front_times.size(); ++i) {
-            auto nearest_time = findNearestTime(optimized_poses, front_times[i], 100000);
+            auto nearest_time = findNearestTime(optimized_poses, front_times[i], FLAGS_near_time_tol);
             if(optimized_poses.find(nearest_time) == optimized_poses.end()) {
                 std::cerr << "Front pose not found in optimized poses!" << std::endl;
                 continue;
             }
             Eigen::Quaterniond quat(front_poses[i](6), front_poses[i](3), front_poses[i](4), front_poses[i](5));      
-            SO3Prior* so3prior = new SO3Prior(quat, Eigen::Vector3d(0.1, 0.1, 0.1));
+            SO3Prior* so3prior = new SO3Prior(quat, Eigen::Vector3d(FLAGS_rot_prior_sigma, FLAGS_rot_prior_sigma, FLAGS_rot_prior_sigma));
             rotation_optimizer.AddResidualBlock(
                 new ceres::AutoDiffCostFunction<SO3Prior, 3, 4>(so3prior),
                 nullptr, optimized_poses[nearest_time].data() + 3);
         }
 
         for (size_t i = 0; i < actual_back_times.size(); ++i) {
-            auto nearest_time = findNearestTime(optimized_poses, actual_back_times[i], 100000);
+            auto nearest_time = findNearestTime(optimized_poses, actual_back_times[i], FLAGS_near_time_tol);
             if(optimized_poses.find(nearest_time) == optimized_poses.end()) {
                 continue;
             }
             Eigen::Quaterniond quat_back(back_poses[i](6), back_poses[i](3), back_poses[i](4), back_poses[i](5));
-            SO3Prior* so3prior = new SO3Prior(quat_back, Eigen::Vector3d(0.1, 0.1, 0.1));
+            SO3Prior* so3prior = new SO3Prior(quat_back, Eigen::Vector3d(FLAGS_rot_prior_sigma, FLAGS_rot_prior_sigma, FLAGS_rot_prior_sigma));
             rotation_optimizer.AddResidualBlock(
                 new ceres::AutoDiffCostFunction<SO3Prior, 3, 4>(so3prior),
                 nullptr, optimized_poses[nearest_time].data() + 3);
@@ -413,7 +416,7 @@ public:
             Eigen::Quaterniond quat_next(odometry_poses[i + 1](6), odometry_poses[i + 1](3), odometry_poses[i + 1](4), odometry_poses[i + 1](5));
             Eigen::Quaterniond b1_q_b2 = quat.inverse() * quat_next;
 
-            SO3Edge* so3edge = new SO3Edge(b1_q_b2, Eigen::Vector3d(0.1, 0.1, 0.1));
+            SO3Edge* so3edge = new SO3Edge(b1_q_b2, Eigen::Vector3d(FLAGS_relative_rot_sigma, FLAGS_relative_rot_sigma, FLAGS_relative_rot_sigma));
             rotation_optimizer.AddResidualBlock(
                 new ceres::AutoDiffCostFunction<SO3Edge, 3, 4, 4>(so3edge),
                 nullptr, optimized_poses[odometry_times[i]].data() + 3, optimized_poses[odometry_times[i + 1]].data() + 3);
@@ -430,25 +433,26 @@ public:
 
     void OptimizeTranslation() {
         ceres::Problem translation_optimizer;
-
         // add prior translations from the front and the back
         for (size_t i = 0; i < front_times.size(); ++i) {
-            auto nearest_time = findNearestTime(optimized_poses, front_times[i], 100000);
+            auto nearest_time = findNearestTime(optimized_poses, front_times[i], FLAGS_near_time_tol);
             if(optimized_poses.find(nearest_time) == optimized_poses.end()) {
                 std::cerr << "Front pose not found in optimized poses!" << std::endl;
                 continue;
             }
-            PositionPrior* front_prior = new PositionPrior(front_poses[i].block<3, 1>(0, 0), Eigen::Vector3d(0.1, 0.1, 0.1));
+            PositionPrior* front_prior = new PositionPrior(front_poses[i].block<3, 1>(0, 0),
+                    Eigen::Vector3d(FLAGS_trans_prior_sigma, FLAGS_trans_prior_sigma, FLAGS_trans_prior_sigma));
             translation_optimizer.AddResidualBlock(
                 new ceres::AutoDiffCostFunction<PositionPrior, 3, 3>(front_prior), 
                 nullptr, optimized_poses[nearest_time].data());
         }
         for (size_t i = 0; i < actual_back_times.size(); ++i) {
-            auto nearest_time = findNearestTime(optimized_poses, actual_back_times[i], 100000);
+            auto nearest_time = findNearestTime(optimized_poses, actual_back_times[i], FLAGS_near_time_tol);
             if(optimized_poses.find(nearest_time) == optimized_poses.end()) {
                 continue;
             }
-            PositionPrior* back_prior = new PositionPrior(back_poses[i].block<3, 1>(0, 0), Eigen::Vector3d(0.1, 0.1, 0.1));
+            PositionPrior* back_prior = new PositionPrior(back_poses[i].block<3, 1>(0, 0), 
+                    Eigen::Vector3d(FLAGS_trans_prior_sigma, FLAGS_trans_prior_sigma, FLAGS_trans_prior_sigma));
             translation_optimizer.AddResidualBlock(new ceres::AutoDiffCostFunction<PositionPrior, 3, 3>(back_prior), 
                 nullptr, optimized_poses[nearest_time].data());
         }
@@ -457,20 +461,20 @@ public:
             Eigen::Quaterniond b1_q(odometry_poses[i](6), odometry_poses[i](3), odometry_poses[i](4), odometry_poses[i](5));
             Eigen::Vector3d b1_p_b2 = b1_q.inverse() * w_p_b1b2;
 
-            Eigen::Quaterniond b1_q_new(optimized_poses[odometry_times[i]].block<4, 1>(3, 0));
-            PositionEdge* edge = new PositionEdge(b1_p_b2, b1_q_new, Eigen::Vector3d(0.001, 0.001, 0.001));
+            Eigen::Quaterniond w_q_b1_new(optimized_poses[odometry_times[i]].block<4, 1>(3, 0));
+            PositionEdge* edge = new PositionEdge(b1_p_b2, w_q_b1_new, 
+                    Eigen::Vector3d(FLAGS_relative_trans_sigma, FLAGS_relative_trans_sigma, FLAGS_relative_trans_sigma));
             translation_optimizer.AddResidualBlock(new ceres::AutoDiffCostFunction<PositionEdge, 3, 3, 3>(edge),
                 nullptr, optimized_poses[odometry_times[i]].data(), optimized_poses[odometry_times[i + 1]].data());
             Eigen::Vector3d error;
             edge->operator()(optimized_poses[odometry_times[i]].data(), optimized_poses[odometry_times[i + 1]].data(), error.data());
-            if (error.norm() > 1000) {
+            if (error.norm() > 1 / FLAGS_relative_trans_sigma) {
                 Eigen::Vector3d w_p_b1 = optimized_poses[odometry_times[i]].block<3, 1>(0, 0);
                 Eigen::Vector3d w_p_b2 = optimized_poses[odometry_times[i + 1]].block<3, 1>(0, 0);
-                Eigen::Quaterniond w_q_b1 = b1_q_new;
-                Eigen::Vector3d pred = w_q_b1.inverse() * (w_p_b2 - w_p_b1);
+                Eigen::Vector3d pred = w_q_b1_new.inverse() * (w_p_b2 - w_p_b1);
                 error = pred - b1_p_b2;
-                std::cout << "Pred " << pred.x() << " " << pred.y() << " " << pred.z() << std::endl;
-                std::cout << "Error: " << error.x() << " " << error.y() << " " << error.z() << std::endl;
+                std::cout << "Predicted b1_p_b2: " << pred.x() << " " << pred.y() << " " << pred.z() << std::endl;
+                std::cout << "Raw error: " << error.x() << " " << error.y() << " " << error.z() << std::endl;
                 std::cerr << "Large error in odometry edge: " << error.norm() << std::endl;
             }
         }
@@ -489,30 +493,28 @@ public:
         for (auto &pose : optimized_poses) {
             pose_graph_optimizer.AddParameterBlock(pose.second.data(), 7, pose_manifold); 
         }
-        double position_sigma = 0.1;
-        double orientation_sigma = 0.05;
-        double relative_position_sigma = 0.001;
-        double relative_orientation_sigma = 0.001;
 
         for (size_t i = 0; i < front_times.size(); ++i) {
-            auto nearest_time = findNearestTime(optimized_poses, front_times[i], 100000);
+            auto nearest_time = findNearestTime(optimized_poses, front_times[i], FLAGS_near_time_tol);
             if(optimized_poses.find(nearest_time) == optimized_poses.end()) {
                 std::cerr << "Front pose not found in optimized poses!" << std::endl;
                 continue;
             }
             Eigen::Matrix<double, 6, 1> sigmaPQ;
-            sigmaPQ << position_sigma, position_sigma, position_sigma, orientation_sigma, orientation_sigma, orientation_sigma;
+            sigmaPQ << FLAGS_trans_prior_sigma, FLAGS_trans_prior_sigma, FLAGS_trans_prior_sigma,
+                    FLAGS_rot_prior_sigma, FLAGS_rot_prior_sigma, FLAGS_rot_prior_sigma;
             EdgeSE3Prior* prior = new EdgeSE3Prior(front_poses[i], sigmaPQ);
             pose_graph_optimizer.AddResidualBlock(prior, nullptr, optimized_poses[nearest_time].data());
         }
 
         for (size_t i = 0; i < actual_back_times.size(); ++i) {
-            auto nearest_time = findNearestTime(optimized_poses, actual_back_times[i], 100000);
+            auto nearest_time = findNearestTime(optimized_poses, actual_back_times[i], FLAGS_near_time_tol);
             if(optimized_poses.find(nearest_time) == optimized_poses.end()) {
                 continue;
             }
             Eigen::Matrix<double, 6, 1> sigmaPQ;
-            sigmaPQ << position_sigma, position_sigma, position_sigma, orientation_sigma, orientation_sigma, orientation_sigma;
+            sigmaPQ << FLAGS_trans_prior_sigma, FLAGS_trans_prior_sigma, FLAGS_trans_prior_sigma,
+                    FLAGS_rot_prior_sigma, FLAGS_rot_prior_sigma, FLAGS_rot_prior_sigma;
             EdgeSE3Prior* prior = new EdgeSE3Prior(back_poses[i], sigmaPQ);
             pose_graph_optimizer.AddResidualBlock(prior, nullptr, optimized_poses[nearest_time].data());
         }
@@ -528,9 +530,11 @@ public:
             T_ab.block<3, 1>(0, 0) = b1_p_b2;
             T_ab.block<4, 1>(3, 0) = q_relative.coeffs();
             Eigen::Matrix<double, 6, 1> sigmaPQ;
-            sigmaPQ << relative_position_sigma, relative_position_sigma, relative_position_sigma, relative_orientation_sigma, relative_orientation_sigma, relative_orientation_sigma;
+            sigmaPQ << FLAGS_relative_trans_sigma, FLAGS_relative_trans_sigma, FLAGS_relative_trans_sigma,
+                    FLAGS_relative_rot_sigma, FLAGS_relative_rot_sigma, FLAGS_relative_rot_sigma;
             EdgeSE3* edge = new EdgeSE3(T_ab, sigmaPQ);
-            pose_graph_optimizer.AddResidualBlock(edge, nullptr, optimized_poses[odometry_times[i]].data(), optimized_poses[odometry_times[i + 1]].data());
+            pose_graph_optimizer.AddResidualBlock(edge, nullptr, optimized_poses[odometry_times[i]].data(),
+                    optimized_poses[odometry_times[i + 1]].data());
         }
         ceres::Solver::Options options;
         options.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
@@ -546,23 +550,24 @@ public:
 
 
 int main(int argc, char **argv) {
-    if (argc < 2) {
-        std::cerr << "Usage: " << argv[0] << " data_path" << std::endl;
+    if (argc < 5) {
+        std::cerr << "Usage: " << argv[0] << " odom_file front_loc_file back_loc_file output_path [and other gflags]" << std::endl;
         return 1;
     }
-    std::string data_path = argv[1];
-    std::string front_loc_file =  data_path + "/front/scan_states.txt";
-    std::string back_loc_file =  data_path + "/back/scan_states.txt";
-    std::string odometry_file = data_path + "/odom/scan_states.txt";
-    std::string back_time_file = data_path + "/back/bag_maxtime.txt";
-    
+    std::string odometry_file = argv[1];
+    std::string front_loc_file = argv[2];
+    std::string back_loc_file = argv[3];
+    std::string back_loc_folder = back_loc_file.substr(0, back_loc_file.find_last_of("/"));
+    std::string back_time_file = back_loc_folder + "/bag_maxtime.txt";
+    std::string output_path = argv[4];
+
     CascadedPgo cpgo(front_loc_file, back_loc_file, odometry_file, back_time_file);
     cpgo.InitializePoses();
-    cpgo.saveResults(data_path + "/initial_poses.txt");
+    cpgo.saveResults(output_path + "/initial_poses.txt");
     // cpgo.OptimizeRotation();
     // cpgo.saveResults(data_path + "/rotated_poses.txt");
     cpgo.OptimizeTranslation();
-    cpgo.saveResults(data_path + "/translated_poses.txt");
+    cpgo.saveResults(output_path + "/translated_poses.txt");
     cpgo.OptimizePoseGraph();
-    cpgo.saveResults(data_path + "/final_poses.txt");
+    cpgo.saveResults(output_path + "/final_poses.txt");
 }
