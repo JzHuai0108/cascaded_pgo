@@ -36,10 +36,15 @@ INCLUDE_DIRECTORIES(
   ${catkin_INCLUDE_DIRS}
 )
 
-ADD_EXECUTABLE(densifyPoses
-  src/densifyPoses.cpp
+ADD_EXECUTABLE(pgo
+  src/pgo.cpp
+  src/pose_factors.cpp
   src/hamilton_quaternion.cpp
-  src/pose_local_parameterization.cpp
-  src/pose_factors.cpp)
+  include/okvis/Duration.hpp
+  include/okvis/Time.hpp
+  include/okvis/implementation/Duration.hpp
+  include/okvis/implementation/Time.hpp
+  )
 
-TARGET_LINK_LIBRARIES(densifyPoses PUBLIC ${catkin_LIBRARIES} ${CERES_LIBRARIES} glog)
+
+TARGET_LINK_LIBRARIES(pgo PUBLIC ${catkin_LIBRARIES} ${CERES_LIBRARIES} ${GFLAGS_LIBRARIES} glog)

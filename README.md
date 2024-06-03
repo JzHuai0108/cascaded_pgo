@@ -26,13 +26,13 @@ make install
 ```
 mkdir -p catkin_ws/src
 cd catkin_ws/src
-git clone --recursive git@bitbucket.org:JzHuai0108/densify_poses.git
+git clone --recursive git@bitbucket.org:JzHuai0108/cascaded_pgo.git
 
 wstool init
-wstool merge densify_poses/dependencies.rosinstall
+wstool merge cascaded_pgo/dependencies.rosinstall
 wstool update -j 8
 cd ..
-catkin build densify_poses -DCMAKE_BUILD_TYPE=Release -j4 -DPYTHON_EXECUTABLE=/usr/bin/python3 \
+catkin build cascaded_pgo -DCMAKE_BUILD_TYPE=Release -j4 -DPYTHON_EXECUTABLE=/usr/bin/python3 \
   -DCeres_DIR=/home/$USER/Documents/slam_devel/lib/cmake/Ceres \
   -DGLOG_INCLUDE_DIR_HINTS=/usr/include -DGLOG_LIBRARY_DIR_HINTS=/usr/lib
 
@@ -40,7 +40,7 @@ catkin build densify_poses -DCMAKE_BUILD_TYPE=Release -j4 -DPYTHON_EXECUTABLE=/u
 
 # Run
 ```
-densify_exe=/media/jhuai/docker/densify_poses_ws/devel/lib/densify_poses/densifyPoses
+densify_exe=/media/jhuai/docker/cascaded_pgo_ws/devel/lib/cascaded_pgo/densifyPoses
 cd $OUTPUTDIR
 $densify_exe $OUTPUTDIR/trajectory.txt $OUTPUTDIR/keyframeTrajectory.txt
 ```

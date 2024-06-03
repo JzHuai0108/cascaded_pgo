@@ -1,4 +1,4 @@
-folder='densify_poses/test/data/';
+folder='cascaded_pgo/test/data/';
 ftxt = [folder, 'dataset-corridor1_512_16_poses.txt'];
 kftxt = [folder, 'dataset-corridor1_512_16_kfposes.txt'];
 dftxt = [folder, 'dense_poses.txt'];
