@@ -318,6 +318,12 @@ okvis::Time findNearestTime(
     }
 }
 
+// check whether a file exists
+bool exists(const std::string &name) {
+    std::ifstream f(name.c_str());
+    return f.good();
+}
+
 class CascadedPgo {
 public:
     EIGEN_MAKE_ALIGNED_OPERATOR_NEW    
@@ -342,9 +348,15 @@ public:
         load_poses(back_loc_file, back_times, back_poses, cull_begin_secs, cull_end_secs);
 
         load_poses(odometry_file, odometry_times, odometry_poses);
-        okvis::Time max_bag_time;
-        load_times(back_time_file, max_bag_time);
-        actual_back_times = correct_back_times(back_times, max_bag_time);
+        bool back_time_file_exists = exists(back_time_file);
+        if (back_time_file_exists) {
+            okvis::Time max_bag_time;
+            load_times(back_time_file, max_bag_time);
+            actual_back_times = correct_back_times(back_times, max_bag_time);
+        } else {
+            std::cerr << "Back time file, " << back_time_file << ", not found or not specified. Will use the original times." << std::endl;
+            actual_back_times = back_times;
+        }
     }
 
     void InitializePoses() {
