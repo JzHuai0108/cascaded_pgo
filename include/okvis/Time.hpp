@@ -110,50 +110,9 @@ class NoHighPerformanceTimersException : std::runtime_error {
  ** Functions
  *********************************************************************/
 
-// void normalizeSecNSec(uint64_t& sec, uint64_t& nsec);
-// void normalizeSecNSec(uint32_t& sec, uint32_t& nsec);
-// void normalizeSecNSecUnsigned(int64_t& sec, int64_t& nsec);
-
-void normalizeSecNSec(uint64_t& sec, uint64_t& nsec) {
-  uint64_t nsec_part = nsec % 1000000000UL;
-  uint64_t sec_part = nsec / 1000000000UL;
-
-  if (sec_part > UINT_MAX)
-    throw std::runtime_error("Time is out of dual 32-bit range");
-
-  sec += sec_part;
-  nsec = nsec_part;
-}
-
-void normalizeSecNSec(uint32_t& sec, uint32_t& nsec) {
-  uint64_t sec64 = sec;
-  uint64_t nsec64 = nsec;
-
-  normalizeSecNSec(sec64, nsec64);
-
-  sec = (uint32_t) sec64;
-  nsec = (uint32_t) nsec64;
-}
-
-void normalizeSecNSecUnsigned(int64_t& sec, int64_t& nsec) {
-  int64_t nsec_part = nsec;
-  int64_t sec_part = sec;
-
-  while (nsec_part >= 1000000000L) {
-    nsec_part -= 1000000000L;
-    ++sec_part;
-  }
-  while (nsec_part < 0) {
-    nsec_part += 1000000000L;
-    --sec_part;
-  }
-
-  if (sec_part < 0 || sec_part > INT_MAX)
-    throw std::runtime_error("Time is out of dual 32-bit range");
-
-  sec = sec_part;
-  nsec = nsec_part;
-}
+void normalizeSecNSec(uint64_t& sec, uint64_t& nsec);
+void normalizeSecNSec(uint32_t& sec, uint32_t& nsec);
+void normalizeSecNSecUnsigned(int64_t& sec, int64_t& nsec);
 
 /*********************************************************************
  ** Time Classes
@@ -306,6 +265,7 @@ class WallTime : public TimeBase<WallTime, WallDuration> {
   }
 };
 
+Time minusSafe(Time right, Duration dura);
 std::ostream &operator <<(std::ostream &os, const Time &rhs);
 std::ostream &operator <<(std::ostream &os, const WallTime &rhs);
 

@@ -324,6 +324,48 @@ bool exists(const std::string &name) {
     return f.good();
 }
 
+void associateAndUpdate(const std::vector<okvis::Time> &odom_times,
+    const std::vector<Eigen::Matrix<double, 7, 1>, Eigen::aligned_allocator<Eigen::Matrix<double, 7, 1>>> &odom_poses,
+    std::vector<okvis::Time> &loc_times,
+    std::vector<Eigen::Matrix<double, 7, 1>, Eigen::aligned_allocator<Eigen::Matrix<double, 7, 1>>> &loc_poses) {
+    std::vector<okvis::Time> new_loc_times;
+    new_loc_times.reserve(loc_times.size());
+    std::vector<Eigen::Matrix<double, 7, 1>, Eigen::aligned_allocator<Eigen::Matrix<double, 7, 1>>> new_loc_poses;
+    new_loc_poses.reserve(loc_poses.size());
+
+    for (int i = 0; i < (int)loc_times.size(); ++i) {
+        auto it = std::upper_bound(odom_times.begin(), odom_times.end(), loc_times[i]);
+        if (it == odom_times.end()) {
+            std::cerr << "No upper odometry time found for " << loc_times[i] << ", max odometry time is " << odom_times.back() << std::endl;
+            continue;
+        }
+        okvis::Time odomtime = *it;
+        okvis::Time left = loc_times[i];
+        int leftid = i;
+        int rightid = i + 1;
+        while (rightid < (int)loc_times.size() && loc_times[rightid] < odomtime) {
+            ++rightid;
+        }
+        if (rightid == (int)loc_times.size()) {
+            std::cerr << "No right loc time found for " << odomtime << ", max loc time is " << loc_times.back() << std::endl;
+            break;
+        }
+        okvis::Time right = loc_times[rightid];
+        double ratio = (odomtime - left).toSec() / (right - left).toSec();
+        Eigen::Matrix<double, 7, 1> new_loc_pose;
+        new_loc_pose.head<3>() = loc_poses[leftid].head<3>() + ratio * (loc_poses[rightid].head<3>() - loc_poses[leftid].head<3>());
+        Eigen::Quaterniond quat_left(loc_poses[leftid](6), loc_poses[leftid](3), loc_poses[leftid](4), loc_poses[leftid](5));
+        Eigen::Quaterniond quat_right(loc_poses[rightid](6), loc_poses[rightid](3), loc_poses[rightid](4), loc_poses[rightid](5));
+        Eigen::Quaterniond quat_new = quat_left.slerp(ratio, quat_right);
+        new_loc_pose.block<4, 1>(3, 0) = quat_new.coeffs();
+        new_loc_times.push_back(odomtime);
+        new_loc_poses.push_back(new_loc_pose);
+    }
+    loc_times = new_loc_times;
+    loc_poses = new_loc_poses;
+
+}
+
 class CascadedPgo {
 public:
     EIGEN_MAKE_ALIGNED_OPERATOR_NEW    
@@ -353,10 +395,25 @@ public:
             okvis::Time max_bag_time;
             load_times(back_time_file, max_bag_time);
             actual_back_times = correct_back_times(back_times, max_bag_time);
+            std::cout << "Max bag time " << max_bag_time << std::endl;
+            // reverse the actual_back_times and back_poses
+            std::reverse(actual_back_times.begin(), actual_back_times.end());
+            std::reverse(back_poses.begin(), back_poses.end());
         } else {
             std::cerr << "Back time file, " << back_time_file << ", not found or not specified. Will use the original times." << std::endl;
             actual_back_times = back_times;
         }
+    }
+
+    void associateAndInterpolatePoses() {
+        associateAndUpdate(odometry_times, odometry_poses, front_times, front_poses);
+        associateAndUpdate(odometry_times, odometry_poses, actual_back_times, back_poses);
+        std::cout << "Assoicated new front poses " << front_times.size() << " from "
+            << front_times.front() << " to " << front_times.back() << " of duration "
+            << (front_times.back() - front_times.front()).toSec() << " s" << std::endl;
+        std::cout << "Assoicated new back poses " << actual_back_times.size() << " from "
+            << actual_back_times.front() << " to " << actual_back_times.back() << " of duration "
+            << (actual_back_times.back() - actual_back_times.front()).toSec() << " s" << std::endl;
     }
 
     void InitializePoses() {
@@ -578,6 +635,7 @@ int main(int argc, char **argv) {
         std::cerr << "Usage: " << argv[0] << " odom_file front_loc_file back_loc_file output_path [and other gflags]" << std::endl;
         return 1;
     }
+    google::ParseCommandLineFlags(&argc, &argv, true);
     std::string odometry_file = argv[1];
     std::string front_loc_file = argv[2];
     std::string back_loc_file = argv[3];
@@ -589,7 +647,10 @@ int main(int argc, char **argv) {
     std::cout << "Back loc: " << back_loc_file << std::endl;
     std::cout << "Back time: " << back_time_file << std::endl;
     std::cout << "Output path: " << output_path << std::endl;
+    std::cout << "Cull begin seconds: " << FLAGS_cull_begin_secs << std::endl;
+    std::cout << "Cull end seconds: " << FLAGS_cull_end_secs << std::endl;
     CascadedPgo cpgo(front_loc_file, back_loc_file, odometry_file, back_time_file);
+    cpgo.associateAndInterpolatePoses();
     cpgo.InitializePoses();
     cpgo.saveResults(output_path + "/initial_poses.txt");
     cpgo.OptimizeRotation();

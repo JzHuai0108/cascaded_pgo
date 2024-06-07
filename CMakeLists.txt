@@ -40,11 +40,8 @@ ADD_EXECUTABLE(pgo
   src/pgo.cpp
   src/pose_factors.cpp
   src/hamilton_quaternion.cpp
-  include/okvis/Duration.hpp
-  include/okvis/Time.hpp
-  include/okvis/implementation/Duration.hpp
-  include/okvis/implementation/Time.hpp
-  )
-
+  src/Time.cpp
+  src/Duration.cpp
+)
 
 TARGET_LINK_LIBRARIES(pgo PUBLIC ${catkin_LIBRARIES} ${CERES_LIBRARIES} ${GFLAGS_LIBRARIES} glog)

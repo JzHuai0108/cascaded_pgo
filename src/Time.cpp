@@ -95,7 +95,7 @@ const Time TIME_MIN(0, 1);
  */
 void okvis_walltime(uint32_t& sec, uint32_t& nsec)
 #ifndef WIN32    
-                        throw (NoHighPerformanceTimersException)
+                        noexcept(false)
 #endif
 {
 #ifndef WIN32
@@ -274,6 +274,14 @@ bool Time::waitForValid(const okvis::WallDuration& /*timeout*/) {
   return true;*/
   throw std::runtime_error("Unimplemented function");
   return false;
+}
+
+Time minusSafe(Time right, Duration dura) {
+  if (right > Time(dura.sec, dura.nsec)) {
+    return right - dura;
+  } else {
+    return Time(0, 0);
+  }
 }
 
 std::ostream& operator<<(std::ostream& os, const Time &rhs) {
