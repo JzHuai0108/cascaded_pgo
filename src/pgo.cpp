@@ -34,6 +34,9 @@ DEFINE_double(trans_prior_sigma, 0.1, "Prior sigma for translation");
 DEFINE_double(rot_prior_sigma, 0.05, "Prior sigma for rotation");
 DEFINE_double(relative_trans_sigma, 0.01, "Relative translation sigma in about 0.1 sec");
 DEFINE_double(relative_rot_sigma, 0.005, "Relative rotation sigma in about 0.1 sec");
+DEFINE_bool(opt_rotation_only, true, "Perform rotation only optimization");
+DEFINE_bool(opt_translation_only, true, "Perform translation only optimization");
+DEFINE_bool(opt_poses, true, "Perform 6DOF pose graph optimization");
 
 class SO3Prior {
 public:
@@ -337,7 +340,7 @@ void associateAndUpdate(const std::vector<okvis::Time> &odom_times,
         auto it = std::upper_bound(odom_times.begin(), odom_times.end(), loc_times[i]);
         if (it == odom_times.end()) {
             std::cerr << "No upper odometry time found for " << loc_times[i] << ", max odometry time is " << odom_times.back() << std::endl;
-            continue;
+            break;
         }
         okvis::Time odomtime = *it;
         okvis::Time left = loc_times[i];
@@ -369,12 +372,12 @@ void associateAndUpdate(const std::vector<okvis::Time> &odom_times,
 class CascadedPgo {
 public:
     EIGEN_MAKE_ALIGNED_OPERATOR_NEW    
-    std::vector<okvis::Time> front_times;
-    std::vector<Eigen::Matrix<double, 7, 1>, Eigen::aligned_allocator<Eigen::Matrix<double, 7, 1>>> front_poses;
+    std::vector<okvis::Time> front_times, front_times_orig;
+    std::vector<Eigen::Matrix<double, 7, 1>, Eigen::aligned_allocator<Eigen::Matrix<double, 7, 1>>> front_poses, front_poses_orig;
 
     std::vector<okvis::Time> back_times;
-    std::vector<okvis::Time> actual_back_times;
-    std::vector<Eigen::Matrix<double, 7, 1>, Eigen::aligned_allocator<Eigen::Matrix<double, 7, 1>>> back_poses;
+    std::vector<okvis::Time> actual_back_times, back_times_orig;
+    std::vector<Eigen::Matrix<double, 7, 1>, Eigen::aligned_allocator<Eigen::Matrix<double, 7, 1>>> back_poses, back_poses_orig;
  
     std::vector<okvis::Time> odometry_times;
     std::vector<Eigen::Matrix<double, 7, 1>, Eigen::aligned_allocator<Eigen::Matrix<double, 7, 1>>> odometry_poses;
@@ -406,6 +409,10 @@ public:
     }
 
     void associateAndInterpolatePoses() {
+        front_times_orig = front_times;
+        back_times_orig = actual_back_times;
+        front_poses_orig = front_poses;
+        back_poses_orig = back_poses;
         associateAndUpdate(odometry_times, odometry_poses, front_times, front_poses);
         associateAndUpdate(odometry_times, odometry_poses, actual_back_times, back_poses);
         std::cout << "Assoicated new front poses " << front_times.size() << " from "
@@ -444,7 +451,7 @@ public:
                 transformation_found = true;
             }
         }
-        
+
         for (size_t i = 0; i < odometry_times.size(); ++i) {
             Eigen::Matrix<double, 7, 1> pose;
             Eigen::Quaterniond quat(odometry_poses[i](6), odometry_poses[i](3), odometry_poses[i](4), odometry_poses[i](5));
@@ -453,6 +460,42 @@ public:
             pose.block<3, 1>(0, 0) = trans;
             pose.block<4, 1>(3, 0) = quat.coeffs();
             optimized_poses[odometry_times[i]] = pose;
+        }
+        // add the front and back poses not in odometry_times
+        size_t i = 0;
+        size_t n = 0;
+        for (; i < front_times_orig.size(); ++i) {
+            okvis::Time t = front_times_orig[i];
+            if (odometry_times[0] - t > okvis::Duration(0.05)) {
+                optimized_poses[t] = front_poses_orig[i];
+                ++n;
+            }
+        }
+        if (n) {
+            std::cout << "front_times front " << front_times.front() << ", orig front " << front_times_orig.front() 
+                << ", orig cut " << front_times_orig[i-1] << ", n " << n << std::endl;
+
+            front_times.insert(front_times.begin(), front_times_orig.begin(), front_times_orig.begin() + i);
+            front_poses.insert(front_poses.begin(), front_poses_orig.begin(), front_poses_orig.begin() + i);
+        }
+
+        size_t s = 0;
+        n = 0;
+        for (i = 0; i < back_times_orig.size(); ++i) {
+            okvis::Time t = back_times_orig[i];
+            if (t - odometry_times.back() > okvis::Duration(0.05)) {
+                optimized_poses[t] = back_poses_orig[i];
+                if (s == 0) {
+                    s = i;
+                }
+                ++n;
+            }
+        }
+        if (n) {
+            std::cout << "back_times back " << actual_back_times.back() << ", orig cut " 
+                    << back_times_orig[s] << ", orig back " << back_times_orig.back() << ", n " << n << std::endl;
+            actual_back_times.insert(actual_back_times.end(), back_times_orig.begin() + s, back_times_orig.begin() + i);
+            back_poses.insert(back_poses.end(), back_poses_orig.begin() + s, back_poses_orig.begin() + i);
         }
     }
 
@@ -464,6 +507,7 @@ public:
             rotation_optimizer.AddParameterBlock(pose.second.data() + 3, 4, rotmanifold);
         }
 
+        int n = 0;
         for (size_t i = 0; i < front_times.size(); ++i) {
             auto nearest_time = findNearestTime(optimized_poses, front_times[i], FLAGS_near_time_tol);
             if(optimized_poses.find(nearest_time) == optimized_poses.end()) {
@@ -475,11 +519,15 @@ public:
             rotation_optimizer.AddResidualBlock(
                 new ceres::AutoDiffCostFunction<SO3Prior, 3, 4>(so3prior),
                 nullptr, optimized_poses[nearest_time].data() + 3);
+            ++n;
         }
+        std::cout << "Added " << n << " front prior rotations." << std::endl;
 
+        n = 0;
         for (size_t i = 0; i < actual_back_times.size(); ++i) {
             auto nearest_time = findNearestTime(optimized_poses, actual_back_times[i], FLAGS_near_time_tol);
             if(optimized_poses.find(nearest_time) == optimized_poses.end()) {
+                std::cerr << "Back pose not found in optimized poses!" << std::endl;
                 continue;
             }
             Eigen::Quaterniond quat_back(back_poses[i](6), back_poses[i](3), back_poses[i](4), back_poses[i](5));
@@ -487,10 +535,16 @@ public:
             rotation_optimizer.AddResidualBlock(
                 new ceres::AutoDiffCostFunction<SO3Prior, 3, 4>(so3prior),
                 nullptr, optimized_poses[nearest_time].data() + 3);
+            ++n;
         }
+        std::cout << "Added " << n << " back prior rotations." << std::endl;
 
         // add odometry constraints
+        n = 0;
         for (size_t i = 0; i < odometry_times.size() - 1; ++i) {
+            okvis::Time ot = odometry_times[i];
+            okvis::Time startpriorend = front_times.back();
+            okvis::Time endpriorstart = actual_back_times.front();
             Eigen::Quaterniond quat(odometry_poses[i](6), odometry_poses[i](3), odometry_poses[i](4), odometry_poses[i](5));
             Eigen::Quaterniond quat_next(odometry_poses[i + 1](6), odometry_poses[i + 1](3), odometry_poses[i + 1](4), odometry_poses[i + 1](5));
             Eigen::Quaterniond b1_q_b2 = quat.inverse() * quat_next;
@@ -499,7 +553,9 @@ public:
             rotation_optimizer.AddResidualBlock(
                 new ceres::AutoDiffCostFunction<SO3Edge, 3, 4, 4>(so3edge),
                 nullptr, optimized_poses[odometry_times[i]].data() + 3, optimized_poses[odometry_times[i + 1]].data() + 3);
+            ++n;
         }
+        std::cout << "Added " << n << " relative odometry constraints." << std::endl;
 
         ceres::Solver::Options options;
         options.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
@@ -537,6 +593,9 @@ public:
                 nullptr, optimized_poses[nearest_time].data());
         }
         for (size_t i = 0; i < odometry_times.size() - 1; ++i) {
+            okvis::Time ot = odometry_times[i];
+            okvis::Time startpriorend = front_times.back();
+            okvis::Time endpriorstart = actual_back_times.front();
             Eigen::Vector3d w_p_b1b2 = odometry_poses[i + 1].block<3, 1>(0, 0) - odometry_poses[i].block<3, 1>(0, 0);
             Eigen::Quaterniond b1_q(odometry_poses[i](6), odometry_poses[i](3), odometry_poses[i](4), odometry_poses[i](5));
             Eigen::Vector3d b1_p_b2 = b1_q.inverse() * w_p_b1b2;
@@ -600,6 +659,9 @@ public:
             pose_graph_optimizer.AddResidualBlock(prior, nullptr, optimized_poses[nearest_time].data());
         }
         for (size_t i = 0; i < odometry_times.size() - 1; ++i) {
+            okvis::Time ot = odometry_times[i];
+            okvis::Time startpriorend = front_times.back();
+            okvis::Time endpriorstart = actual_back_times.front();
             Eigen::Vector3d w_p_b1b2 = odometry_poses[i + 1].block<3, 1>(0, 0) - odometry_poses[i].block<3, 1>(0, 0);
             Eigen::Quaterniond q_b1(odometry_poses[i].block<4, 1>(3, 0));
             Eigen::Vector3d b1_p_b2 = q_b1.inverse() * w_p_b1b2;
@@ -653,10 +715,16 @@ int main(int argc, char **argv) {
     cpgo.associateAndInterpolatePoses();
     cpgo.InitializePoses();
     cpgo.saveResults(output_path + "/initial_poses.txt");
-    cpgo.OptimizeRotation();
-    cpgo.saveResults(output_path + "/rotated_poses.txt");
-    cpgo.OptimizeTranslation();
-    cpgo.saveResults(output_path + "/translated_poses.txt");
-    cpgo.OptimizePoseGraph();
-    cpgo.saveResults(output_path + "/final_poses.txt");
+    if (FLAGS_opt_rotation_only) {
+        cpgo.OptimizeRotation();
+        cpgo.saveResults(output_path + "/rotated_poses.txt");
+    }
+    if (FLAGS_opt_translation_only) {
+        cpgo.OptimizeTranslation();
+        cpgo.saveResults(output_path + "/translated_poses.txt");
+    }
+    if (FLAGS_opt_poses) {
+        cpgo.OptimizePoseGraph();
+        cpgo.saveResults(output_path + "/final_poses.txt");
+    }
 }
