@@ -37,6 +37,33 @@ DEFINE_double(relative_rot_sigma, 0.005, "Relative rotation sigma in about 0.1 s
 DEFINE_bool(opt_rotation_only, true, "Perform rotation only optimization");
 DEFINE_bool(opt_translation_only, true, "Perform translation only optimization");
 DEFINE_bool(opt_poses, true, "Perform 6DOF pose graph optimization");
+DEFINE_string(gnss_loc_file, "", "GNSS position file for GNSS constraints E_p_B, B is the IMU frame of the GNSS/INS system.");
+DEFINE_double(gnss_sigma_xy, 0.2, "GNSS position sigma in xy plane");
+DEFINE_double(gnss_sigma_z, 1.0, "GNSS position sigma in z");
+DEFINE_string(L_p_B, "0 0.06 -0.16", "position of the INS body in the L frame");
+DEFINE_double(td, 0.0, "Time delay of the odometry system, td + odometry original times = odometry times in GNSS clock");
+DEFINE_double(huber_width, 5.0, "Huber loss width for GNSS position residuals");
+
+struct GnssPosition {
+    EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+    okvis::Time time;
+    Eigen::Vector3d position;
+    Eigen::Vector3d sigma;
+    int status; // NavSatFix status
+
+    GnssPosition(const okvis::Time &t, const Eigen::Vector3d &p, const Eigen::Vector3d &s, int st) : time(t), position(p), sigma(s), status(st) {}
+
+    friend std::ostream &operator<<(std::ostream &os, const GnssPosition &gp) {
+        os << gp.time << " " << gp.position.transpose() << " " << gp.sigma.transpose() << " " << gp.status;
+        return os;
+    }
+
+    bool operator<(const GnssPosition &gp) const {
+        return time < gp.time;
+    }
+};
+
+typedef std::vector<GnssPosition, Eigen::aligned_allocator<GnssPosition>> PositionVector;
 
 class SO3Prior {
 public:
@@ -137,6 +164,31 @@ private:
     Eigen::Vector3d sigma_p_;
 };
 
+class PositionEdge2 {
+public:
+    EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+    PositionEdge2(const Eigen::Vector3d &E_p_B, const Eigen::Vector3d &L_p_B, const Eigen::Vector3d &sigma_p)
+        : E_p_B_(E_p_B), L_p_B_(L_p_B), sigma_p_(sigma_p) {}
+
+    template <typename T>
+    bool operator()(const T *const W_T_L, const T *const E_T_W, T *residual) const {
+        Eigen::Map<const Eigen::Matrix<T, 3, 1>> W_p_L(W_T_L);
+        Eigen::Map<const Eigen::Quaternion<T>> W_q_L(W_T_L + 3);
+        Eigen::Map<const Eigen::Matrix<T, 3, 1>> E_p_W(E_T_W);
+        Eigen::Map<const Eigen::Quaternion<T>> E_q_W(E_T_W + 3);
+        Eigen::Map<Eigen::Matrix<T, 3, 1>> residual_map(residual);
+        Eigen::Matrix<T, 3, 1> W_p_B = W_p_L + W_q_L * L_p_B_.template cast<T>();
+        Eigen::Matrix<T, 3, 1> E_p_B = E_p_W + E_q_W * W_p_B;
+        residual_map = (E_p_B - E_p_B_.template cast<T>()).cwiseQuotient(sigma_p_.template cast<T>());
+        return true;
+    }
+
+private:
+    Eigen::Vector3d E_p_B_;
+    Eigen::Vector3d L_p_B_;
+    Eigen::Vector3d sigma_p_;
+};
+
 size_t load_poses(const std::string &posefile,
     std::vector<okvis::Time> &times, 
     std::vector<Eigen::Matrix<double, 7, 1>, Eigen::aligned_allocator<Eigen::Matrix<double, 7, 1>>> &poses,
@@ -182,6 +234,10 @@ size_t load_poses(const std::string &posefile,
         times.push_back(time);
         poses.push_back(pose);
     }
+    if (times.empty()) {
+        std::cerr << "No poses loaded from " << posefile << std::endl;
+        return 1;
+    }
     // cull the end
     okvis::Time end_time = times.back();
     okvis::Time cull_end_time = end_time - cull_end_secs;
@@ -198,6 +254,69 @@ size_t load_poses(const std::string &posefile,
     times.erase(times.begin(), it);
     poses.erase(poses.begin(), poses.begin() + n);
     return 0;
+}
+
+size_t load_gnss_positions(const std::string &gnss_file, PositionVector &gnss_positions) {
+    std::ifstream stream(gnss_file);
+    if (!stream.is_open()) {
+        std::cerr << "Failed to open file " << gnss_file << std::endl;
+        return 1;
+    }
+    while (!stream.eof()) {
+        std::string line;
+        std::getline(stream, line);
+        if (line[0] == '#' || line.empty()) {
+            continue;
+        }
+        std::istringstream iss(line);
+        std::string time_str;
+        std::getline(iss, time_str, ',');
+        // keep the time precision to nanoseconds
+        std::string::size_type pos = time_str.find('.');
+        uint32_t sec, nsec;
+        try {
+            sec = std::stoul(time_str.substr(0, pos));
+            std::string nsecstr = time_str.substr(pos + 1);
+            if (nsecstr.size() < 9) {
+                nsecstr.append(9 - nsecstr.size(), '0');
+            }
+            nsec = std::stoul(nsecstr);
+        } catch (std::exception &e) {
+            std::cerr << "Failed to parse time string: " << time_str << " in " << gnss_file << std::endl;
+            return 1;
+        }
+        okvis::Time time(sec, nsec);
+
+        Eigen::Vector3d position;
+        char delim;
+        for (size_t i = 0; i < 3; ++i) {
+            iss >> position[i] >> delim;
+        }
+        int status;
+        float val;
+        for (size_t i = 0;  i < 9; ++i) {
+            iss >> val >> delim;
+        }
+        status = val;
+
+        gnss_positions.emplace_back(time, position, 
+                Eigen::Vector3d(FLAGS_gnss_sigma_xy, FLAGS_gnss_sigma_xy, FLAGS_gnss_sigma_z), status);
+    }
+    stream.close();
+    if (gnss_positions.empty()) {
+        std::cerr << "No GNSS positions loaded from " << gnss_file << std::endl;
+        return 1;
+    }
+    std::cout << "Loaded " << gnss_positions.size() << " GNSS positions from " << gnss_file << std::endl;
+    std::cout << "First GNSS position at " << gnss_positions.front() << std::endl;
+    return 0;
+}
+
+void shift_gnss_times(double td, PositionVector &gnss_positions) {
+    okvis::Duration d(td);
+    for (auto &gp : gnss_positions) {
+        gp.time -= d;
+    }
 }
 
 std::vector<okvis::Time> correct_back_times(std::vector<okvis::Time> &back_times, const okvis::Time &max_bag_time) {
@@ -385,6 +504,11 @@ public:
     std::map<okvis::Time, Eigen::Matrix<double, 7, 1>, std::less<okvis::Time>, 
         Eigen::aligned_allocator<std::pair<const okvis::Time, Eigen::Matrix<double, 7, 1>>>> optimized_poses;
 
+    PositionVector gnss_positions;
+    Eigen::Matrix4d init_E_T_tls;
+    Eigen::Matrix<double, 7, 1> est_E_T_tls;
+    Eigen::Vector3d L_p_B_;
+
     CascadedPgo(const std::string &front_loc_file, const std::string &back_loc_file, const std::string &odometry_file,
             const std::string &back_time_file) {
         okvis::Duration cull_end_secs(FLAGS_cull_end_secs);
@@ -405,6 +529,16 @@ public:
         } else {
             std::cerr << "Back time file, " << back_time_file << ", not found or not specified. Will use the original times." << std::endl;
             actual_back_times = back_times;
+        }
+        if (!FLAGS_gnss_loc_file.empty()) {
+            load_gnss_positions(FLAGS_gnss_loc_file, gnss_positions);
+            shift_gnss_times(FLAGS_td, gnss_positions);
+            L_p_B_ = Eigen::Matrix<double, 3, 1>::Zero();
+            std::istringstream iss(FLAGS_L_p_B);
+            for (int i = 0; i < 3; ++i) {
+                iss >> L_p_B_[i];
+            }
+            std::cout << "L_p_B: " << L_p_B_.transpose() << std::endl;
         }
     }
 
@@ -427,30 +561,45 @@ public:
         // Compute transformation from odometry to front using the first poses of front and odometry
         Eigen::Quaterniond w_rot_wodom;
         Eigen::Vector3d w_trans_wodom;
-        bool transformation_found = false;
-        for (size_t i = 0; i < front_times.size() && !transformation_found; ++i) {
-            if (!odometry_times.empty()) {
-                auto it = std::lower_bound(odometry_times.begin(), odometry_times.end(), front_times[i]);
-                if (it == odometry_times.end()) {
-                    continue;
-                }
-                size_t j = it - odometry_times.begin();    
-                Eigen::Quaterniond quat_front(front_poses[i](6), front_poses[i](3), front_poses[i](4), front_poses[i](5));
-                Eigen::Quaterniond quat_odom(odometry_poses[j](6), odometry_poses[j](3), odometry_poses[j](4), odometry_poses[j](5));
-                Eigen::Vector3d trans_front(front_poses[i].block<3, 1>(0, 0));
-                Eigen::Vector3d trans_odom(odometry_poses[j].block<3, 1>(0, 0));
-                Eigen::Matrix4d T_front = Eigen::Matrix4d::Identity();
-                T_front.block<3, 3>(0, 0) = quat_front.toRotationMatrix();
-                T_front.block<3, 1>(0, 3) = trans_front;
-                Eigen::Matrix4d T_odom = Eigen::Matrix4d::Identity();
-                T_odom.block<3, 3>(0, 0) = quat_odom.toRotationMatrix();
-                T_odom.block<3, 1>(0, 3) = trans_odom;
-                Eigen::Matrix4d w_T_wodom = T_front * T_odom.inverse();
-                w_rot_wodom = Eigen::Quaterniond(w_T_wodom.block<3, 3>(0, 0));
-                w_trans_wodom = w_T_wodom.block<3, 1>(0, 3);
-                transformation_found = true;
-            }
+
+        Eigen::Matrix<double, 3, -1> odom_points(3, front_times.size());
+        Eigen::Matrix<double, 3, -1> front_points(3, front_times.size());
+        for (size_t i = 0; i < front_times.size(); ++i) {
+            auto it = std::lower_bound(odometry_times.begin(), odometry_times.end(), front_times[i]);
+            size_t j = it - odometry_times.begin();    
+            Eigen::Quaterniond quat_front(front_poses[i](6), front_poses[i](3), front_poses[i](4), front_poses[i](5));
+            Eigen::Quaterniond quat_odom(odometry_poses[j](6), odometry_poses[j](3), odometry_poses[j](4), odometry_poses[j](5));
+            Eigen::Vector3d trans_front(front_poses[i].block<3, 1>(0, 0));
+            Eigen::Vector3d trans_odom(odometry_poses[j].block<3, 1>(0, 0));
+            Eigen::Matrix4d T_front = Eigen::Matrix4d::Identity();
+            T_front.block<3, 3>(0, 0) = quat_front.toRotationMatrix();
+            T_front.block<3, 1>(0, 3) = trans_front;
+            Eigen::Matrix4d T_odom = Eigen::Matrix4d::Identity();
+            T_odom.block<3, 3>(0, 0) = quat_odom.toRotationMatrix();
+            T_odom.block<3, 1>(0, 3) = trans_odom;
+            Eigen::Matrix4d w_T_wodom = T_front * T_odom.inverse();
+            w_rot_wodom = Eigen::Quaterniond(w_T_wodom.block<3, 3>(0, 0));
+            w_trans_wodom = w_T_wodom.block<3, 1>(0, 3);
+            std::cout << "w_trans_wodom: " << w_trans_wodom.transpose() << std::endl;
+            std::cout << "w_rot_wodom: " << w_rot_wodom.toRotationMatrix() << std::endl;
+            break;
         }
+
+        for (size_t i = 0; i < front_times.size(); ++i) {
+            auto it = std::lower_bound(odometry_times.begin(), odometry_times.end(), front_times[i]);
+            if (it == odometry_times.end()) {
+                continue;
+            }
+            if (*it - front_times[i] > okvis::Duration(0.001)) {
+                std::cout << "Front time " << front_times[i] << " is not close to odometry time " << *it << std::endl;
+            }
+            odom_points.col(i) = odometry_poses[it - odometry_times.begin()].block<3, 1>(0, 0);
+            front_points.col(i) = front_poses[i].block<3, 1>(0, 0);
+        }
+        Eigen::Matrix4d W_T_odom = Eigen::umeyama(odom_points, front_points, false);
+        std::cout << "Initial W_T_odom by Umeyama: " << std::endl << W_T_odom << std::endl;
+
+
 
         for (size_t i = 0; i < odometry_times.size(); ++i) {
             Eigen::Matrix<double, 7, 1> pose;
@@ -496,6 +645,47 @@ public:
                     << back_times_orig[s] << ", orig back " << back_times_orig.back() << ", n " << n << std::endl;
             actual_back_times.insert(actual_back_times.end(), back_times_orig.begin() + s, back_times_orig.begin() + i);
             back_poses.insert(back_poses.end(), back_poses_orig.begin() + s, back_poses_orig.begin() + i);
+        }
+    }
+
+    void FitGnssPositions() {
+        if (gnss_positions.size()) {
+            // interpolate the gnss positions at optimized pose times, also compute the robust E_T_W.
+            PositionVector fitted_gnss_positions;
+            int validindex = 0;
+            Eigen::Matrix<double, 3, -1> tls_points(3, optimized_poses.size());
+            Eigen::Matrix<double, 3, -1> gnss_points(3, optimized_poses.size());
+            for (const auto& tp : optimized_poses) {
+                okvis::Time t = tp.first;
+                GnssPosition p(t, Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero(), 0);
+                auto it = std::upper_bound(gnss_positions.begin(), gnss_positions.end(), p);
+                if (it == gnss_positions.end() || it == gnss_positions.begin()) {
+                    continue;
+                }
+                auto it_prev = std::prev(it);
+                okvis::Duration dt = it->time - it_prev->time;
+                if (dt > okvis::Duration(1.0)) {
+                    continue;
+                }
+                double ratio = (t - it_prev->time).toSec() / (it->time - it_prev->time).toSec();
+                Eigen::Vector3d pos = it_prev->position + ratio * (it->position - it_prev->position);
+                fitted_gnss_positions.emplace_back(t, pos, it->sigma, it->status);
+
+                tls_points.col(validindex) = tp.second.block<3, 1>(0, 0);
+                gnss_points.col(validindex) = pos;
+                ++validindex;
+            }
+            std::cout << "Fitted " << fitted_gnss_positions.size() << " GNSS positions from " << gnss_positions.size() << std::endl;
+            gnss_positions = fitted_gnss_positions;
+
+            tls_points.conservativeResize(3, validindex);
+            gnss_points.conservativeResize(3, validindex);
+            init_E_T_tls = Eigen::umeyama(tls_points, gnss_points, false);
+            std::cout << "Initial E_T_W by Umeyama: " << std::endl << init_E_T_tls << std::endl;
+            est_E_T_tls = Eigen::Matrix<double, 7, 1>::Zero();
+            est_E_T_tls.head<3>() = init_E_T_tls.block<3, 1>(0, 3);
+            Eigen::Quaterniond quat(init_E_T_tls.block<3, 3>(0, 0));
+            est_E_T_tls.block<4, 1>(3, 0) = quat.coeffs();
         }
     }
 
@@ -625,13 +815,17 @@ public:
         ceres::Solve(options, &translation_optimizer, &summary);
     }
 
-    void OptimizePoseGraph() {
+    void OptimizePoseGraph(const std::string &output_path) {
         std::cout << "Optimizing 6DoF pose graph..." << std::endl;
         ceres::Problem pose_graph_optimizer;
         ceres::Manifold *pose_manifold = new ceres::PoseManifoldSimplified();
+        ceres::LossFunction *loss_function = new ceres::HuberLoss(FLAGS_huber_width);
 
         for (auto &pose : optimized_poses) {
             pose_graph_optimizer.AddParameterBlock(pose.second.data(), 7, pose_manifold); 
+        }
+        if (gnss_positions.size() > 0) {
+            pose_graph_optimizer.AddParameterBlock(est_E_T_tls.data(), 7, pose_manifold);
         }
 
         for (size_t i = 0; i < front_times.size(); ++i) {
@@ -679,11 +873,61 @@ public:
             pose_graph_optimizer.AddResidualBlock(edge, nullptr, optimized_poses[odometry_times[i]].data(),
                     optimized_poses[odometry_times[i + 1]].data());
         }
+
+        FitGnssPositions();
+        size_t count = 0;
+        std::vector<okvis::Duration> deltas;
+        deltas.reserve(gnss_positions.size());
+        okvis::Time last_time;
+        int step = 5;
+        std::string gnss_error_file = output_path + "/gnss_errors.txt";
+        std::cout << "Writing GNSS errors to " << gnss_error_file << std::endl;
+        std::ofstream ofs(gnss_error_file, std::ios::out);
+        for (size_t i = 0; i < gnss_positions.size(); i += step) {
+            okvis::Time t = gnss_positions[i].time;
+            int status = gnss_positions[i].status;
+            auto nearest_time = findNearestTime(optimized_poses, t, FLAGS_near_time_tol);
+            if(optimized_poses.find(nearest_time) == optimized_poses.end()) {
+                std::cerr << "GNSS pose not found in optimized poses!" << std::endl;
+                continue;
+            }
+            Eigen::Vector3d sigma(FLAGS_gnss_sigma_xy, FLAGS_gnss_sigma_xy, FLAGS_gnss_sigma_z);
+            if (status != 0) {
+                sigma *= 10;
+            }
+            PositionEdge2 *edge = new PositionEdge2(gnss_positions[i].position, L_p_B_, sigma);
+            auto costfunction = new ceres::AutoDiffCostFunction<PositionEdge2, 3, 7, 7>(edge);
+            pose_graph_optimizer.AddResidualBlock(costfunction,
+                    loss_function, optimized_poses[nearest_time].data(), est_E_T_tls.data());
+            Eigen::Vector3d error;
+            edge->operator()(optimized_poses[nearest_time].data(), est_E_T_tls.data(), error.data());
+            ofs << t << " " << error[0] << " " << error[1] << " " << error[2] << " " << error.norm() << std::endl;
+            if (count > 0) {
+                okvis::Duration delta = t - last_time;
+                deltas.push_back(delta);
+            }
+            ++count;
+            last_time = t;
+        }
+
         ceres::Solver::Options options;
         options.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
         options.minimizer_progress_to_stdout = true;
         ceres::Solver::Summary summary;
         ceres::Solve(options, &pose_graph_optimizer, &summary);
+        if (deltas.size() > 0) {
+            std::cout << "Added " << count << " GNSS constraints out of " << gnss_positions.size();
+            std::sort(deltas.begin(), deltas.end());
+            std::cout << ", min gap " << deltas.front().toSec() << " s, max gap " << deltas.back().toSec() << " s";
+            std::cout << ", median gap " << deltas[deltas.size() / 2].toSec() << " s" << std::endl;
+
+            std::cout << "Initial E_T_tls: " << init_E_T_tls << std::endl;
+            Eigen::Quaterniond quat(est_E_T_tls.block<4, 1>(3, 0));
+            Eigen::Matrix4d est_E_T_tls_mat = Eigen::Matrix4d::Identity();
+            est_E_T_tls_mat.block<3, 3>(0, 0) = quat.toRotationMatrix();
+            est_E_T_tls_mat.block<3, 1>(0, 3) = est_E_T_tls.block<3, 1>(0, 0);
+            std::cout << "Estimated E_T_tls: " << est_E_T_tls_mat << std::endl;
+        }
     }
 
     void saveResults(const std::string &output_file) const {
@@ -695,6 +939,10 @@ public:
 int main(int argc, char **argv) {
     if (argc < 5) {
         std::cerr << "Usage: " << argv[0] << " odom_file front_loc_file back_loc_file output_path [and other gflags]" << std::endl;
+        std::cout << "odom_file contains the poses of L frame in the odometry frame" << std::endl;
+        std::cout << "front_loc_file contains the poses of L frame in the world frame" << std::endl;
+        std::cout << "back_loc_file contains the poses of L frame in the world frame" << std::endl;
+        std::cout << "output_path is the folder to save the optimized poses W_T_L" << std::endl;
         return 1;
     }
     google::ParseCommandLineFlags(&argc, &argv, true);
@@ -724,7 +972,7 @@ int main(int argc, char **argv) {
         cpgo.saveResults(output_path + "/translated_poses.txt");
     }
     if (FLAGS_opt_poses) {
-        cpgo.OptimizePoseGraph();
+        cpgo.OptimizePoseGraph(output_path);
         cpgo.saveResults(output_path + "/final_poses.txt");
     }
 }
