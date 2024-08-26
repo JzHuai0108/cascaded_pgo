@@ -27,22 +27,27 @@
 #include "pose_factors.h"
 #include <gflags/gflags.h>
 
-DEFINE_double(cull_begin_secs, 1.5, "Cull the poses at the beginning of the front loc session and the backward loc session to avoid the jittering part");
-DEFINE_double(cull_end_secs, 8.0, "Cull the poses at the end of the front loc session and the backward loc session to avoid the drift part");
+#include "geodetic_enu_converter.h"
+
+DEFINE_double(cull_begin_secs, 0.0, "Cull the poses at the beginning of the front loc session and the backward loc session to avoid the jittering part");
+DEFINE_double(cull_end_secs, 0.0, "Cull the poses at the end of the front loc session and the backward loc session to avoid the drift part");
 DEFINE_int32(near_time_tol, 100000, "Tolerance in nanoseconds for finding the nearest pose in time");
 DEFINE_double(trans_prior_sigma, 0.1, "Prior sigma for translation");
 DEFINE_double(rot_prior_sigma, 0.05, "Prior sigma for rotation");
-DEFINE_double(relative_trans_sigma, 0.01, "Relative translation sigma in about 0.1 sec");
-DEFINE_double(relative_rot_sigma, 0.005, "Relative rotation sigma in about 0.1 sec");
+DEFINE_double(relative_trans_sigma, 0.01, "Relative translation sigma in about 0.1 sec, enlarge this value to reduce small spikes in PGO result.");
+DEFINE_double(relative_rot_sigma, 0.005, "Relative rotation sigma in about 0.1 sec, enlarge this value to reduce small spikes in PGO result");
 DEFINE_bool(opt_rotation_only, true, "Perform rotation only optimization");
 DEFINE_bool(opt_translation_only, true, "Perform translation only optimization");
 DEFINE_bool(opt_poses, true, "Perform 6DOF pose graph optimization");
-DEFINE_string(gnss_loc_file, "", "GNSS position file for GNSS constraints E_p_B, B is the IMU frame of the GNSS/INS system.");
-DEFINE_double(gnss_sigma_xy, 0.2, "GNSS position sigma in xy plane");
+DEFINE_double(gnss_sigma_xy, 0.25, "GNSS position sigma in xy plane");
 DEFINE_double(gnss_sigma_z, 1.0, "GNSS position sigma in z");
-DEFINE_string(L_p_B, "0 0.06 -0.16", "position of the INS body in the L frame");
+DEFINE_string(L_p_B, "0 0.06 -0.16", "position of the x36d INS body in the L frame");
+DEFINE_string(E_T_tls, "", "pose of the TLS in the GNSS E frame, if provided, it will be locked in PGO.");
 DEFINE_double(td, 0.0, "Time delay of the odometry system, td + odometry original times = odometry times in GNSS clock");
-DEFINE_double(huber_width, 5.0, "Huber loss width for GNSS position residuals");
+DEFINE_double(huber_width, 2.0, "Huber loss width for GNSS position residuals");
+DEFINE_bool(use_nhc, true, "Use non-holonomic constraint in PGO");
+DEFINE_double(nh_sigma, 0.1, "Non-holonomic constraint sigma for left and up velocity of the vehicle.");
+DEFINE_bool(gnss_to_enu, false, "Convert the UTM 50 GNSS positions to ENU frame and then used for PGO constraints");
 
 struct GnssPosition {
     EIGEN_MAKE_ALIGNED_OPERATOR_NEW
@@ -93,6 +98,38 @@ public:
 private:
     Eigen::Quaterniond q_;
     Eigen::Vector3d sigma_q_;
+};
+
+// note the lidar frame is left back up wrt to the vehicle.
+class NonHolonimicConstraint {
+public:
+    EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+    NonHolonimicConstraint(const double dt, const Eigen::Vector2d &sigma_v_yz)
+        : dt_(dt), sigma_v_yz_(sigma_v_yz) {}
+
+    template <typename T>
+    bool operator()(const T *const W_T_L1, const T *const W_T_L2, T *residual) const {
+        Eigen::Map<const Eigen::Matrix<T, 3, 1>> W_p_L1(W_T_L1);
+        Eigen::Map<const Eigen::Quaternion<T>> W_q_L1(W_T_L1 + 3);
+        Eigen::Map<const Eigen::Matrix<T, 3, 1>> W_p_L2(W_T_L2);
+        Eigen::Map<const Eigen::Quaternion<T>> W_q_L2(W_T_L2 + 3);
+        Eigen::Map<Eigen::Matrix<T, 2, 1>> residual_map(residual);
+
+        Eigen::Matrix<T, 3, 1> W_v_L1 = (W_p_L2 - W_p_L1) / T(dt_);
+        Eigen::Matrix<T, 3, 1> L_v1 = W_q_L1.conjugate() * W_v_L1;
+        residual_map[0] = L_v1[0] / sigma_v_yz_[0]; // left
+        residual_map[1] = L_v1[2] / sigma_v_yz_[1]; // up
+        return true;
+    }
+
+    static ceres::CostFunction *Create(const double dt, const Eigen::Vector2d &sigma_v_yz) {
+        return new ceres::AutoDiffCostFunction<NonHolonimicConstraint, 2, 7, 7>(
+            new NonHolonimicConstraint(dt, sigma_v_yz));
+    }
+
+private:
+    double dt_;
+    Eigen::Vector2d sigma_v_yz_;
 };
 
 class SO3Edge {
@@ -256,12 +293,15 @@ size_t load_poses(const std::string &posefile,
     return 0;
 }
 
-size_t load_gnss_positions(const std::string &gnss_file, PositionVector &gnss_positions) {
+size_t load_gnss_positions(const std::string &gnss_file, 
+        PositionVector &gnss_positions, Eigen::Vector3d &anchor_llh, bool gnss_to_enu) {
     std::ifstream stream(gnss_file);
     if (!stream.is_open()) {
         std::cerr << "Failed to open file " << gnss_file << std::endl;
         return 1;
     }
+    VecVec3d llh_list;
+    llh_list.reserve(1000);
     while (!stream.eof()) {
         std::string line;
         std::getline(stream, line);
@@ -292,9 +332,18 @@ size_t load_gnss_positions(const std::string &gnss_file, PositionVector &gnss_po
         for (size_t i = 0; i < 3; ++i) {
             iss >> position[i] >> delim;
         }
+        Eigen::Matrix<double, 4, 1> quat;
+        for (size_t i = 0; i < 4; ++i) {
+            iss >> quat[i] >> delim;
+        }
+        Eigen::Vector3d llh;
+        for (size_t i = 0; i < 3; ++i) {
+            iss >> llh[i] >> delim;
+        }
+        llh_list.push_back(llh);
         int status;
         float val;
-        for (size_t i = 0;  i < 9; ++i) {
+        for (size_t i = 0;  i < 2; ++i) {
             iss >> val >> delim;
         }
         status = val;
@@ -303,6 +352,16 @@ size_t load_gnss_positions(const std::string &gnss_file, PositionVector &gnss_po
                 Eigen::Vector3d(FLAGS_gnss_sigma_xy, FLAGS_gnss_sigma_xy, FLAGS_gnss_sigma_z), status);
     }
     stream.close();
+
+    anchor_llh = llh_list.front();
+    if (gnss_to_enu) {
+        VecVec3d enu_list;
+        geodeticToEnu(llh_list, anchor_llh, enu_list);
+        for (size_t i = 0; i < enu_list.size(); ++i) {
+            gnss_positions[i].position = enu_list[i];
+        }
+    }
+
     if (gnss_positions.empty()) {
         std::cerr << "No GNSS positions loaded from " << gnss_file << std::endl;
         return 1;
@@ -491,12 +550,8 @@ void associateAndUpdate(const std::vector<okvis::Time> &odom_times,
 class CascadedPgo {
 public:
     EIGEN_MAKE_ALIGNED_OPERATOR_NEW    
-    std::vector<okvis::Time> front_times, front_times_orig;
-    std::vector<Eigen::Matrix<double, 7, 1>, Eigen::aligned_allocator<Eigen::Matrix<double, 7, 1>>> front_poses, front_poses_orig;
-
-    std::vector<okvis::Time> back_times;
-    std::vector<okvis::Time> actual_back_times, back_times_orig;
-    std::vector<Eigen::Matrix<double, 7, 1>, Eigen::aligned_allocator<Eigen::Matrix<double, 7, 1>>> back_poses, back_poses_orig;
+    std::vector<okvis::Time> tls_times, tls_times_orig;
+    std::vector<Eigen::Matrix<double, 7, 1>, Eigen::aligned_allocator<Eigen::Matrix<double, 7, 1>>> tls_poses, tls_poses_orig;
  
     std::vector<okvis::Time> odometry_times;
     std::vector<Eigen::Matrix<double, 7, 1>, Eigen::aligned_allocator<Eigen::Matrix<double, 7, 1>>> odometry_poses;
@@ -505,33 +560,20 @@ public:
         Eigen::aligned_allocator<std::pair<const okvis::Time, Eigen::Matrix<double, 7, 1>>>> optimized_poses;
 
     PositionVector gnss_positions;
+    Eigen::Vector3d anchor_llh;
     Eigen::Matrix4d init_E_T_tls;
     Eigen::Matrix<double, 7, 1> est_E_T_tls;
     Eigen::Vector3d L_p_B_;
 
-    CascadedPgo(const std::string &front_loc_file, const std::string &back_loc_file, const std::string &odometry_file,
-            const std::string &back_time_file) {
+    CascadedPgo(const std::string &odometry_file, const std::string &tls_loc_file, const std::string &gnss_loc_file) {
         okvis::Duration cull_end_secs(FLAGS_cull_end_secs);
         okvis::Duration cull_begin_secs(FLAGS_cull_begin_secs);
-        load_poses(front_loc_file, front_times, front_poses, cull_begin_secs, cull_end_secs);
-        load_poses(back_loc_file, back_times, back_poses, cull_begin_secs, cull_end_secs);
+        load_poses(tls_loc_file, tls_times, tls_poses, cull_begin_secs, cull_end_secs);
 
         load_poses(odometry_file, odometry_times, odometry_poses);
-        bool back_time_file_exists = exists(back_time_file);
-        if (back_time_file_exists) {
-            okvis::Time max_bag_time;
-            load_times(back_time_file, max_bag_time);
-            actual_back_times = correct_back_times(back_times, max_bag_time);
-            std::cout << "Max bag time " << max_bag_time << std::endl;
-            // reverse the actual_back_times and back_poses
-            std::reverse(actual_back_times.begin(), actual_back_times.end());
-            std::reverse(back_poses.begin(), back_poses.end());
-        } else {
-            std::cerr << "Back time file, " << back_time_file << ", not found or not specified. Will use the original times." << std::endl;
-            actual_back_times = back_times;
-        }
-        if (!FLAGS_gnss_loc_file.empty()) {
-            load_gnss_positions(FLAGS_gnss_loc_file, gnss_positions);
+
+        if (!gnss_loc_file.empty()) {
+            load_gnss_positions(gnss_loc_file, gnss_positions, anchor_llh, FLAGS_gnss_to_enu);
             shift_gnss_times(FLAGS_td, gnss_positions);
             L_p_B_ = Eigen::Matrix<double, 3, 1>::Zero();
             std::istringstream iss(FLAGS_L_p_B);
@@ -546,19 +588,17 @@ public:
         return !gnss_positions.empty();
     }
 
+    bool useEnuGnss() const {
+        return !gnss_positions.empty() && FLAGS_gnss_to_enu;
+    }
+
     void associateAndInterpolatePoses() {
-        front_times_orig = front_times;
-        back_times_orig = actual_back_times;
-        front_poses_orig = front_poses;
-        back_poses_orig = back_poses;
-        associateAndUpdate(odometry_times, odometry_poses, front_times, front_poses);
-        associateAndUpdate(odometry_times, odometry_poses, actual_back_times, back_poses);
-        std::cout << "Assoicated new front poses " << front_times.size() << " from "
-            << front_times.front() << " to " << front_times.back() << " of duration "
-            << (front_times.back() - front_times.front()).toSec() << " s" << std::endl;
-        std::cout << "Assoicated new back poses " << actual_back_times.size() << " from "
-            << actual_back_times.front() << " to " << actual_back_times.back() << " of duration "
-            << (actual_back_times.back() - actual_back_times.front()).toSec() << " s" << std::endl;
+        tls_times_orig = tls_times;
+        tls_poses_orig = tls_poses;
+        associateAndUpdate(odometry_times, odometry_poses, tls_times, tls_poses);
+        std::cout << "Associated new poses " << tls_times.size() << " from "
+            << tls_times.front() << " to " << tls_times.back() << " of duration "
+            << (tls_times.back() - tls_times.front()).toSec() << " s" << std::endl;
     }
 
     void InitializePoses() {
@@ -566,14 +606,14 @@ public:
         Eigen::Quaterniond w_rot_wodom;
         Eigen::Vector3d w_trans_wodom;
 
-        Eigen::Matrix<double, 3, -1> odom_points(3, front_times.size());
-        Eigen::Matrix<double, 3, -1> front_points(3, front_times.size());
-        for (size_t i = 0; i < front_times.size(); ++i) {
-            auto it = std::lower_bound(odometry_times.begin(), odometry_times.end(), front_times[i]);
+        Eigen::Matrix<double, 3, -1> odom_points(3, tls_times.size());
+        Eigen::Matrix<double, 3, -1> front_points(3, tls_times.size());
+        for (size_t i = 0; i < tls_times.size(); ++i) {
+            auto it = std::lower_bound(odometry_times.begin(), odometry_times.end(), tls_times[i]);
             size_t j = it - odometry_times.begin();    
-            Eigen::Quaterniond quat_front(front_poses[i](6), front_poses[i](3), front_poses[i](4), front_poses[i](5));
+            Eigen::Quaterniond quat_front(tls_poses[i](6), tls_poses[i](3), tls_poses[i](4), tls_poses[i](5));
             Eigen::Quaterniond quat_odom(odometry_poses[j](6), odometry_poses[j](3), odometry_poses[j](4), odometry_poses[j](5));
-            Eigen::Vector3d trans_front(front_poses[i].block<3, 1>(0, 0));
+            Eigen::Vector3d trans_front(tls_poses[i].block<3, 1>(0, 0));
             Eigen::Vector3d trans_odom(odometry_poses[j].block<3, 1>(0, 0));
             Eigen::Matrix4d T_front = Eigen::Matrix4d::Identity();
             T_front.block<3, 3>(0, 0) = quat_front.toRotationMatrix();
@@ -589,21 +629,22 @@ public:
             break;
         }
 
-        for (size_t i = 0; i < front_times.size(); ++i) {
-            auto it = std::lower_bound(odometry_times.begin(), odometry_times.end(), front_times[i]);
-            if (it == odometry_times.end()) {
-                continue;
-            }
-            if (*it - front_times[i] > okvis::Duration(0.001)) {
-                std::cout << "Front time " << front_times[i] << " is not close to odometry time " << *it << std::endl;
-            }
-            odom_points.col(i) = odometry_poses[it - odometry_times.begin()].block<3, 1>(0, 0);
-            front_points.col(i) = front_poses[i].block<3, 1>(0, 0);
-        }
-        Eigen::Matrix4d w_T_wodom = Eigen::umeyama(odom_points, front_points, false);
-        std::cout << "Initial W_T_odom by Umeyama: " << std::endl << w_T_wodom << std::endl;
-        w_rot_wodom = Eigen::Quaterniond(w_T_wodom.block<3, 3>(0, 0));
-        w_trans_wodom = w_T_wodom.block<3, 1>(0, 3);
+        // Refined by Umeyama method, but this is unstable.
+        // for (size_t i = 0; i < tls_times.size(); ++i) {
+        //     auto it = std::lower_bound(odometry_times.begin(), odometry_times.end(), tls_times[i]);
+        //     if (it == odometry_times.end()) {
+        //         continue;
+        //     }
+        //     if (*it - tls_times[i] > okvis::Duration(0.001)) {
+        //         std::cout << "Front time " << tls_times[i] << " is not close to odometry time " << *it << std::endl;
+        //     }
+        //     odom_points.col(i) = odometry_poses[it - odometry_times.begin()].block<3, 1>(0, 0);
+        //     front_points.col(i) = tls_poses[i].block<3, 1>(0, 0);
+        // }
+        // Eigen::Matrix4d w_T_wodom = Eigen::umeyama(odom_points, front_points, false);
+        // std::cout << "Initial W_T_odom by Umeyama: " << std::endl << w_T_wodom << std::endl;
+        // w_rot_wodom = Eigen::Quaterniond(w_T_wodom.block<3, 3>(0, 0));
+        // w_trans_wodom = w_T_wodom.block<3, 1>(0, 3);
 
         for (size_t i = 0; i < odometry_times.size(); ++i) {
             Eigen::Matrix<double, 7, 1> pose;
@@ -617,27 +658,29 @@ public:
         // add the front and back poses not in odometry_times
         size_t i = 0;
         size_t n = 0;
-        for (; i < front_times_orig.size(); ++i) {
-            okvis::Time t = front_times_orig[i];
+        for (; i < tls_times_orig.size(); ++i) {
+            okvis::Time t = tls_times_orig[i];
             if (odometry_times[0] - t > okvis::Duration(0.05)) {
-                optimized_poses[t] = front_poses_orig[i];
+                optimized_poses[t] = tls_poses_orig[i];
                 ++n;
+            } else {
+                break;
             }
         }
         if (n) {
-            std::cout << "front_times front " << front_times.front() << ", orig front " << front_times_orig.front() 
-                << ", orig cut " << front_times_orig[i-1] << ", n " << n << std::endl;
+            std::cout << "tls_times front " << tls_times.front() << ", orig front " << tls_times_orig.front() 
+                << ", orig cut " << tls_times_orig[i-1] << ", n " << n << std::endl;
 
-            front_times.insert(front_times.begin(), front_times_orig.begin(), front_times_orig.begin() + i);
-            front_poses.insert(front_poses.begin(), front_poses_orig.begin(), front_poses_orig.begin() + i);
+            tls_times.insert(tls_times.begin(), tls_times_orig.begin(), tls_times_orig.begin() + i);
+            tls_poses.insert(tls_poses.begin(), tls_poses_orig.begin(), tls_poses_orig.begin() + i);
         }
 
         size_t s = 0;
         n = 0;
-        for (i = 0; i < back_times_orig.size(); ++i) {
-            okvis::Time t = back_times_orig[i];
+        for (i = 0; i < tls_times_orig.size(); ++i) {
+            okvis::Time t = tls_times_orig[i];
             if (t - odometry_times.back() > okvis::Duration(0.05)) {
-                optimized_poses[t] = back_poses_orig[i];
+                optimized_poses[t] = tls_poses_orig[i];
                 if (s == 0) {
                     s = i;
                 }
@@ -645,10 +688,10 @@ public:
             }
         }
         if (n) {
-            std::cout << "back_times back " << actual_back_times.back() << ", orig cut " 
-                    << back_times_orig[s] << ", orig back " << back_times_orig.back() << ", n " << n << std::endl;
-            actual_back_times.insert(actual_back_times.end(), back_times_orig.begin() + s, back_times_orig.begin() + i);
-            back_poses.insert(back_poses.end(), back_poses_orig.begin() + s, back_poses_orig.begin() + i);
+            std::cout << "tls_times back " << tls_times.back() << ", orig cut " 
+                    << tls_times_orig[s] << ", orig back " << tls_times_orig.back() << ", n " << n << std::endl;
+            tls_times.insert(tls_times.end(), tls_times_orig.begin() + s, tls_times_orig.begin() + i);
+            tls_poses.insert(tls_poses.end(), tls_poses_orig.begin() + s, tls_poses_orig.begin() + i);
         }
     }
 
@@ -684,12 +727,26 @@ public:
 
             tls_points.conservativeResize(3, validindex);
             gnss_points.conservativeResize(3, validindex);
-            init_E_T_tls = Eigen::umeyama(tls_points, gnss_points, false);
-            std::cout << "Initial E_T_W by Umeyama: " << std::endl << init_E_T_tls << std::endl;
-            est_E_T_tls = Eigen::Matrix<double, 7, 1>::Zero();
-            est_E_T_tls.head<3>() = init_E_T_tls.block<3, 1>(0, 3);
-            Eigen::Quaterniond quat(init_E_T_tls.block<3, 3>(0, 0));
-            est_E_T_tls.block<4, 1>(3, 0) = quat.coeffs();
+
+            if (FLAGS_E_T_tls.empty() || FLAGS_gnss_to_enu) {
+                init_E_T_tls = Eigen::umeyama(tls_points, gnss_points, false);
+                std::cout << "Initial E_T_W by Umeyama: " << std::endl << init_E_T_tls << std::endl;
+                est_E_T_tls = Eigen::Matrix<double, 7, 1>::Zero();
+                est_E_T_tls.head<3>() = init_E_T_tls.block<3, 1>(0, 3);
+                Eigen::Quaterniond quat(init_E_T_tls.block<3, 3>(0, 0));
+                est_E_T_tls.block<4, 1>(3, 0) = quat.coeffs();
+            } else {
+                est_E_T_tls = Eigen::Matrix<double, 7, 1>::Zero();
+                std::istringstream iss(FLAGS_E_T_tls);
+                for (int i = 0; i < 7; ++i) {
+                    iss >> est_E_T_tls[i];
+                }
+
+                init_E_T_tls = Eigen::Matrix4d::Identity();
+                init_E_T_tls.block<3, 3>(0, 0) = Eigen::Quaterniond(est_E_T_tls.block<4, 1>(3, 0)).toRotationMatrix();
+                init_E_T_tls.block<3, 1>(0, 3) = est_E_T_tls.block<3, 1>(0, 0);
+                std::cout << "Initial E_T_W from FLAGS: " << std::endl << init_E_T_tls << std::endl;
+            }
         }
     }
 
@@ -702,43 +759,25 @@ public:
         }
 
         int n = 0;
-        for (size_t i = 0; i < front_times.size(); ++i) {
-            auto nearest_time = findNearestTime(optimized_poses, front_times[i], FLAGS_near_time_tol);
+        for (size_t i = 0; i < tls_times.size(); ++i) {
+            auto nearest_time = findNearestTime(optimized_poses, tls_times[i], FLAGS_near_time_tol);
             if(optimized_poses.find(nearest_time) == optimized_poses.end()) {
-                std::cerr << "Front pose not found in optimized poses!" << std::endl;
+                std::cerr << "TLS pose not found in optimized poses!" << std::endl;
                 continue;
             }
-            Eigen::Quaterniond quat(front_poses[i](6), front_poses[i](3), front_poses[i](4), front_poses[i](5));      
+            Eigen::Quaterniond quat(tls_poses[i](6), tls_poses[i](3), tls_poses[i](4), tls_poses[i](5));      
             SO3Prior* so3prior = new SO3Prior(quat, Eigen::Vector3d(FLAGS_rot_prior_sigma, FLAGS_rot_prior_sigma, FLAGS_rot_prior_sigma));
             rotation_optimizer.AddResidualBlock(
                 new ceres::AutoDiffCostFunction<SO3Prior, 3, 4>(so3prior),
                 nullptr, optimized_poses[nearest_time].data() + 3);
             ++n;
         }
-        std::cout << "Added " << n << " front prior rotations." << std::endl;
-
-        n = 0;
-        for (size_t i = 0; i < actual_back_times.size(); ++i) {
-            auto nearest_time = findNearestTime(optimized_poses, actual_back_times[i], FLAGS_near_time_tol);
-            if(optimized_poses.find(nearest_time) == optimized_poses.end()) {
-                std::cerr << "Back pose not found in optimized poses!" << std::endl;
-                continue;
-            }
-            Eigen::Quaterniond quat_back(back_poses[i](6), back_poses[i](3), back_poses[i](4), back_poses[i](5));
-            SO3Prior* so3prior = new SO3Prior(quat_back, Eigen::Vector3d(FLAGS_rot_prior_sigma, FLAGS_rot_prior_sigma, FLAGS_rot_prior_sigma));
-            rotation_optimizer.AddResidualBlock(
-                new ceres::AutoDiffCostFunction<SO3Prior, 3, 4>(so3prior),
-                nullptr, optimized_poses[nearest_time].data() + 3);
-            ++n;
-        }
-        std::cout << "Added " << n << " back prior rotations." << std::endl;
+        std::cout << "Added " << n << " TLS prior rotations." << std::endl;
 
         // add odometry constraints
         n = 0;
         for (size_t i = 0; i < odometry_times.size() - 1; ++i) {
             okvis::Time ot = odometry_times[i];
-            okvis::Time startpriorend = front_times.back();
-            okvis::Time endpriorstart = actual_back_times.front();
             Eigen::Quaterniond quat(odometry_poses[i](6), odometry_poses[i](3), odometry_poses[i](4), odometry_poses[i](5));
             Eigen::Quaterniond quat_next(odometry_poses[i + 1](6), odometry_poses[i + 1](3), odometry_poses[i + 1](4), odometry_poses[i + 1](5));
             Eigen::Quaterniond b1_q_b2 = quat.inverse() * quat_next;
@@ -764,32 +803,21 @@ public:
         std::cout << "Optimizing translation..." << std::endl;
         ceres::Problem translation_optimizer;
         // add prior translations from the front and the back
-        for (size_t i = 0; i < front_times.size(); ++i) {
-            auto nearest_time = findNearestTime(optimized_poses, front_times[i], FLAGS_near_time_tol);
+        for (size_t i = 0; i < tls_times.size(); ++i) {
+            auto nearest_time = findNearestTime(optimized_poses, tls_times[i], FLAGS_near_time_tol);
             if(optimized_poses.find(nearest_time) == optimized_poses.end()) {
-                std::cerr << "Front pose not found in optimized poses!" << std::endl;
+                std::cerr << "TLS pose not found in optimized poses!" << std::endl;
                 continue;
             }
-            PositionPrior* front_prior = new PositionPrior(front_poses[i].block<3, 1>(0, 0),
+            PositionPrior* front_prior = new PositionPrior(tls_poses[i].block<3, 1>(0, 0),
                     Eigen::Vector3d(FLAGS_trans_prior_sigma, FLAGS_trans_prior_sigma, FLAGS_trans_prior_sigma));
             translation_optimizer.AddResidualBlock(
                 new ceres::AutoDiffCostFunction<PositionPrior, 3, 3>(front_prior), 
                 nullptr, optimized_poses[nearest_time].data());
         }
-        for (size_t i = 0; i < actual_back_times.size(); ++i) {
-            auto nearest_time = findNearestTime(optimized_poses, actual_back_times[i], FLAGS_near_time_tol);
-            if(optimized_poses.find(nearest_time) == optimized_poses.end()) {
-                continue;
-            }
-            PositionPrior* back_prior = new PositionPrior(back_poses[i].block<3, 1>(0, 0), 
-                    Eigen::Vector3d(FLAGS_trans_prior_sigma, FLAGS_trans_prior_sigma, FLAGS_trans_prior_sigma));
-            translation_optimizer.AddResidualBlock(new ceres::AutoDiffCostFunction<PositionPrior, 3, 3>(back_prior), 
-                nullptr, optimized_poses[nearest_time].data());
-        }
+
         for (size_t i = 0; i < odometry_times.size() - 1; ++i) {
             okvis::Time ot = odometry_times[i];
-            okvis::Time startpriorend = front_times.back();
-            okvis::Time endpriorstart = actual_back_times.front();
             Eigen::Vector3d w_p_b1b2 = odometry_poses[i + 1].block<3, 1>(0, 0) - odometry_poses[i].block<3, 1>(0, 0);
             Eigen::Quaterniond b1_q(odometry_poses[i](6), odometry_poses[i](3), odometry_poses[i](4), odometry_poses[i](5));
             Eigen::Vector3d b1_p_b2 = b1_q.inverse() * w_p_b1b2;
@@ -822,7 +850,7 @@ public:
     void OptimizePoseGraph(const std::string &output_path) {
         std::cout << "Optimizing 6DoF pose graph..." << std::endl;
         ceres::Problem pose_graph_optimizer;
-        ceres::Manifold *pose_manifold = new ceres::PoseManifoldSimplified();
+        ceres::Manifold *pose_manifold = new ceres::PoseManifold();
         ceres::LossFunction *loss_function = new ceres::HuberLoss(FLAGS_huber_width);
 
         for (auto &pose : optimized_poses) {
@@ -830,36 +858,28 @@ public:
         }
         if (gnss_positions.size() > 0) {
             pose_graph_optimizer.AddParameterBlock(est_E_T_tls.data(), 7, pose_manifold);
+            if (!FLAGS_E_T_tls.empty() && !FLAGS_gnss_to_enu) {
+                pose_graph_optimizer.SetParameterBlockConstant(est_E_T_tls.data());
+            }
         }
 
-        for (size_t i = 0; i < front_times.size(); ++i) {
-            auto nearest_time = findNearestTime(optimized_poses, front_times[i], FLAGS_near_time_tol);
+        for (size_t i = 0; i < tls_times.size(); ++i) {
+            auto nearest_time = findNearestTime(optimized_poses, tls_times[i], FLAGS_near_time_tol);
             if(optimized_poses.find(nearest_time) == optimized_poses.end()) {
-                std::cerr << "Front pose not found in optimized poses!" << std::endl;
+                std::cerr << "TLS pose not found in optimized poses!" << std::endl;
                 continue;
             }
             Eigen::Matrix<double, 6, 1> sigmaPQ;
             sigmaPQ << FLAGS_trans_prior_sigma, FLAGS_trans_prior_sigma, FLAGS_trans_prior_sigma,
                     FLAGS_rot_prior_sigma, FLAGS_rot_prior_sigma, FLAGS_rot_prior_sigma;
-            EdgeSE3Prior* prior = new EdgeSE3Prior(front_poses[i], sigmaPQ);
+            ceres::CostFunction *prior = EdgeSE3Prior::Create(tls_poses[i], sigmaPQ);
             pose_graph_optimizer.AddResidualBlock(prior, nullptr, optimized_poses[nearest_time].data());
         }
 
-        for (size_t i = 0; i < actual_back_times.size(); ++i) {
-            auto nearest_time = findNearestTime(optimized_poses, actual_back_times[i], FLAGS_near_time_tol);
-            if(optimized_poses.find(nearest_time) == optimized_poses.end()) {
-                continue;
-            }
-            Eigen::Matrix<double, 6, 1> sigmaPQ;
-            sigmaPQ << FLAGS_trans_prior_sigma, FLAGS_trans_prior_sigma, FLAGS_trans_prior_sigma,
-                    FLAGS_rot_prior_sigma, FLAGS_rot_prior_sigma, FLAGS_rot_prior_sigma;
-            EdgeSE3Prior* prior = new EdgeSE3Prior(back_poses[i], sigmaPQ);
-            pose_graph_optimizer.AddResidualBlock(prior, nullptr, optimized_poses[nearest_time].data());
-        }
         for (size_t i = 0; i < odometry_times.size() - 1; ++i) {
             okvis::Time ot = odometry_times[i];
-            okvis::Time startpriorend = front_times.back();
-            okvis::Time endpriorstart = actual_back_times.front();
+            okvis::Time ot_next = odometry_times[i + 1];
+            double dt = (ot_next - ot).toSec();
             Eigen::Vector3d w_p_b1b2 = odometry_poses[i + 1].block<3, 1>(0, 0) - odometry_poses[i].block<3, 1>(0, 0);
             Eigen::Quaterniond q_b1(odometry_poses[i].block<4, 1>(3, 0));
             Eigen::Vector3d b1_p_b2 = q_b1.inverse() * w_p_b1b2;
@@ -873,9 +893,15 @@ public:
             Eigen::Matrix<double, 6, 1> sigmaPQ;
             sigmaPQ << FLAGS_relative_trans_sigma, FLAGS_relative_trans_sigma, FLAGS_relative_trans_sigma,
                     FLAGS_relative_rot_sigma, FLAGS_relative_rot_sigma, FLAGS_relative_rot_sigma;
-            EdgeSE3* edge = new EdgeSE3(T_ab, sigmaPQ);
+            ceres::CostFunction* edge = EdgeSE3::Create(T_ab, sigmaPQ);
             pose_graph_optimizer.AddResidualBlock(edge, nullptr, optimized_poses[odometry_times[i]].data(),
                     optimized_poses[odometry_times[i + 1]].data());
+            if (FLAGS_use_nhc) {
+                ceres::CostFunction* nhc = NonHolonimicConstraint::Create(
+                    dt, Eigen::Vector2d(FLAGS_nh_sigma, FLAGS_nh_sigma));
+                pose_graph_optimizer.AddResidualBlock(nhc, nullptr, optimized_poses[odometry_times[i]].data(),
+                        optimized_poses[odometry_times[i + 1]].data());
+            }
         }
 
         FitGnssPositions();
@@ -942,6 +968,12 @@ public:
             est_E_T_tls_mat.block<3, 3>(0, 0) = quat.toRotationMatrix();
             est_E_T_tls_mat.block<3, 1>(0, 3) = est_E_T_tls.block<3, 1>(0, 0);
             ss << "Estimated E_T_tls: " << std::endl;
+            ss << std::fixed << std::setprecision(9);
+            for (int i = 0; i < 7; ++i) {
+                ss << est_E_T_tls[i] << " ";
+            }
+            ss << std::endl;
+            ss << "Estimated E_T_tls matrix: " << std::endl;
             for (int i = 0; i < 4; ++i) {
                 for (int j = 0; j < 4; ++j) {
                     ss << est_E_T_tls_mat(i, j) << " ";
@@ -960,36 +992,66 @@ public:
     void saveResults(const std::string &output_file) const {
         outputOptimizedPoses(optimized_poses, output_file); 
     }
+
+    void saveGeorefResults(const std::string &output_file) const {
+        std::ofstream ofs(output_file, std::ios::out);
+        ofs << std::fixed << std::setprecision(9);
+        for (const auto &pose : optimized_poses) {
+            Eigen::Quaterniond W_q_L(pose.second.block<4, 1>(3, 0));
+            Eigen::Vector3d W_p_L = pose.second.block<3, 1>(0, 0);
+            Eigen::Quaterniond E_q_W(est_E_T_tls.block<4, 1>(3, 0));
+            Eigen::Vector3d E_p_W = est_E_T_tls.block<3, 1>(0, 0);
+            Eigen::Quaterniond E_q_L = E_q_W * W_q_L;
+            Eigen::Vector3d E_p_L = E_p_W + E_q_W * W_p_L;
+            ofs << pose.first << " " << E_p_L.x() << " " << E_p_L.y() << " " << E_p_L.z() << " "
+                << E_q_L.x() << " " << E_q_L.y() << " " << E_q_L.z() << " " << E_q_L.w() << std::endl;
+        }
+        ofs.close();
+    }
+
+    void saveEnuPoses(const std::string &enuFile) const {
+        std::ofstream file(enuFile, std::ios::out);
+        file << std::fixed << std::setprecision(9);
+        for (size_t i = 0; i < gnss_positions.size(); ++i) {
+            Eigen::Vector3d enu = gnss_positions[i].position;
+            file << gnss_positions[i].time << " " << enu.x() << " " << enu.y() << " " << enu.z() << std::endl;
+        }
+        file.close();
+        std::cout << "ENU coordinates saved to " << enuFile << std::endl;
+    }
+
 }; // class CascadedPgo
 
 
 int main(int argc, char **argv) {
     if (argc < 5) {
-        std::cerr << "Usage: " << argv[0] << " odom_file front_loc_file back_loc_file output_path [and other gflags]" << std::endl;
+        std::cerr << "Usage: " << argv[0] << " odom_file tls_loc_file gnss_loc_file output_path [and other gflags]" << std::endl;
         std::cout << "odom_file contains the poses of L frame in the odometry frame" << std::endl;
-        std::cout << "front_loc_file contains the poses of L frame in the world frame" << std::endl;
-        std::cout << "back_loc_file contains the poses of L frame in the world frame" << std::endl;
+        std::cout << "tls_loc_file contains the poses of L frame in the world frame" << std::endl;
+        std::cout << "GNSS position file for GNSS constraints E_p_B, B is the IMU frame of the GNSS/INS system." << std::endl;
         std::cout << "output_path is the folder to save the optimized poses W_T_L" << std::endl;
         return 1;
     }
+
     google::ParseCommandLineFlags(&argc, &argv, true);
     std::string odometry_file = argv[1];
-    std::string front_loc_file = argv[2];
-    std::string back_loc_file = argv[3];
-    std::string back_loc_folder = back_loc_file.substr(0, back_loc_file.find_last_of("/"));
-    std::string back_time_file = back_loc_folder + "/bag_maxtime.txt";
+    std::string tls_loc_file = argv[2];
+    std::string gnss_loc_file = argv[3];
     std::string output_path = argv[4];
     std::cout << "Odometry: " << odometry_file << std::endl;
-    std::cout << "Front loc: " << front_loc_file << std::endl;
-    std::cout << "Back loc: " << back_loc_file << std::endl;
-    std::cout << "Back time: " << back_time_file << std::endl;
+    std::cout << "tls loc: " << tls_loc_file << std::endl;
+    std::cout << "GNSS loc: " << gnss_loc_file << std::endl;
     std::cout << "Output path: " << output_path << std::endl;
     std::cout << "Cull begin seconds: " << FLAGS_cull_begin_secs << std::endl;
     std::cout << "Cull end seconds: " << FLAGS_cull_end_secs << std::endl;
-    CascadedPgo cpgo(front_loc_file, back_loc_file, odometry_file, back_time_file);
+    CascadedPgo cpgo(odometry_file, tls_loc_file, gnss_loc_file);
     cpgo.associateAndInterpolatePoses();
     cpgo.InitializePoses();
     cpgo.saveResults(output_path + "/initial_poses.txt");
+    if (cpgo.useEnuGnss()) {
+        std::string enu_file = output_path + "/enu_poses.txt";
+        cpgo.saveEnuPoses(enu_file);
+    }
     if (FLAGS_opt_rotation_only) {
         cpgo.OptimizeRotation();
         cpgo.saveResults(output_path + "/rotated_poses.txt");
@@ -1001,9 +1063,10 @@ int main(int argc, char **argv) {
     if (FLAGS_opt_poses) {
         cpgo.OptimizePoseGraph(output_path);
         std::string final_poses_file = output_path + "/final_poses.txt";
-        if (cpgo.useGnss()) {
-            final_poses_file = output_path + "/final_poses_gnss.txt";
-        }
         cpgo.saveResults(final_poses_file);
+        if (cpgo.useGnss()) {
+            final_poses_file = output_path + "/final_georef_poses.txt";
+            cpgo.saveGeorefResults(final_poses_file);
+        }
     }
 }

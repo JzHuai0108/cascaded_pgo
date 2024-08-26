@@ -37,8 +37,9 @@ INCLUDE_DIRECTORIES(
 )
 
 ADD_EXECUTABLE(pgo
+  src/geodetic_enu_converter.cpp
   src/pgo.cpp
-  src/pose_factors.cpp
+  src/pose_manifold.cpp
   src/hamilton_quaternion.cpp
   src/Time.cpp
   src/Duration.cpp
