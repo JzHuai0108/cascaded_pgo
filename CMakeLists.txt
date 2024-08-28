@@ -37,12 +37,14 @@ INCLUDE_DIRECTORIES(
 )
 
 ADD_EXECUTABLE(pgo
+  src/Duration.cpp
   src/geodetic_enu_converter.cpp
+  src/hamilton_quaternion.cpp
+  src/imu_parameters.cpp
+  src/ImuErrorWithGravity.cpp
   src/pgo.cpp
   src/pose_manifold.cpp
-  src/hamilton_quaternion.cpp
   src/Time.cpp
-  src/Duration.cpp
 )
 
 TARGET_LINK_LIBRARIES(pgo PUBLIC ${catkin_LIBRARIES} ${CERES_LIBRARIES} ${GFLAGS_LIBRARIES} glog)
