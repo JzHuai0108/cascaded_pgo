@@ -63,6 +63,8 @@ DEFINE_double(gnss_sigma_z, 1.0, "GNSS position sigma in z");
 DEFINE_double(gnss_sigma_z_bad, 10.0, "GNSS position sigma in z when a person sees that it is offset by at least 2 meter.");
 DEFINE_int32(gnss_step, 5, "GNSS step for PGO constraints in the unit of odometry intervals");
 DEFINE_int32(imu_step, 1, "IMU step for building PGO constraints in the unit of odometry intervals");
+DEFINE_double(imu_segment_padding, 0.15,
+              "Padding for the IMU segment used in the IMU factors of PGO. This should be slightly larger than imu_step * 0.1");
 DEFINE_string(L_p_B, "0 0.06 -0.16",
               "position of the x36d INS body in the L frame");
 DEFINE_string(B_q_L, "0.00335219412527761 0.00223431365637794 0.707598799333737 0.706602936463248", 
@@ -80,8 +82,7 @@ DEFINE_double(
 DEFINE_bool(gnss_to_enu, false,
             "Convert the UTM 50 GNSS positions to ENU frame and then used for "
             "PGO constraints");
-DEFINE_double(imu_segment_padding, 0.6,
-              "Padding for the IMU segment used in the IMU factors of PGO");
+
 DEFINE_double(vel_sigma, 0.1, "Velocity sigma for the speed prior in PGO");
 DEFINE_string(E_T_tls, "[]",
               "pose of the TLS in the GNSS E frame, if provided, it will be "
@@ -401,7 +402,11 @@ std::shared_ptr<okvis::ImuMeasurementDeque> getImuSegment(
     }
     imu_segment->push_back(imu);
   }
-  assert(imu_segment->size() > 10);
+  if (imu_segment->size() < 10) {
+    std::cout << "Warn: Too few IMU measurements in the segment: "
+              << imu_segment->size() << " from " << start_time << " to "
+              << end_time << std::endl;
+  }
   return imu_segment;
 }
 
@@ -569,7 +574,7 @@ void associateAndUpdate(
       ++rightid;
     }
     if (rightid == (int)loc_times.size()) {
-      std::cerr << "No right loc time found for " << odomtime
+      std::cout << "Warn: No right loc time found for " << odomtime
                 << ", max loc time is " << loc_times.back() << std::endl;
       break;
     }
@@ -956,12 +961,35 @@ class CascadedPgo {
     for (; it != optimized_states.end();) {
       okvis::Time t = it->first;
       auto imuSegment = it->second.imu_til_this;
-      if (!imuSegment) {
+      okvis::Time prevt = previt->first;
+      if (imuSegment->size() == 0) {
         std::stringstream ss;
         ss << t;
-        throw std::runtime_error("No IMU segment found for " + ss.str());
+        std::cout << "Warn: No IMU segment found for " << ss.str() << std::endl;
+        previt = it;
+        for (int i = 0; i < FLAGS_imu_step && it != optimized_states.end(); ++i) {
+          ++it;
+        }
+        continue;
       }
-      okvis::Time prevt = previt->first;
+      if (imuSegment->front().timeStamp > prevt) {
+        std::cout << "Warn: IMU segment front time " << imuSegment->front().timeStamp
+                  << " is later than prev time " << prevt << std::endl;
+        previt = it;
+        for (int i = 0; i < FLAGS_imu_step && it != optimized_states.end(); ++i) {
+          ++it;
+        }
+        continue;
+      }
+      if (imuSegment->back().timeStamp < t) {
+        std::cout << "Warn: IMU segment back time " << imuSegment->back().timeStamp
+                  << " is earlier than time " << t << std::endl;
+        previt = it;
+        for (int i = 0; i < FLAGS_imu_step && it != optimized_states.end(); ++i) {
+          ++it;
+        }
+        continue;
+      }
 
       ::ceres::CostFunction *imuerror(new okvis::ceres::ImuErrorWithGravity(
           *imuSegment, imu_parameters, prevt, t));
@@ -1380,11 +1408,40 @@ class CascadedPgo {
       Eigen::Vector3d E_p_W = est_E_T_tls.block<3, 1>(0, 0);
       Eigen::Quaterniond E_q_L = E_q_W * W_q_L;
       Eigen::Vector3d E_p_L = E_p_W + E_q_W * W_p_L;
-      ofs << state.first << " " << E_p_L.x() << " " << E_p_L.y() << " "
-          << E_p_L.z() << " " << E_q_L.x() << " " << E_q_L.y() << " "
+      ofs << state.first << " " << std::setprecision(6) << E_p_L.x() << " " << E_p_L.y() << " "
+          << E_p_L.z() << " " << std::setprecision(9) << E_q_L.x() << " " << E_q_L.y() << " "
           << E_q_L.z() << " " << E_q_L.w() << std::endl;
     }
     ofs.close();
+  }
+
+  void saveGeorefResultsKitti(const std::string &output_dir) const {
+    std::string posefile = output_dir + "/utm50r_T_xt32_kitti.txt";
+    std::string timefile = output_dir + "/times_kitti.txt";
+    std::ofstream timeofs(timefile, std::ios::out);
+    timeofs << std::fixed << std::setprecision(9);
+    for (const auto &state : optimized_states) {
+      timeofs << state.first << std::endl;
+    }
+    timeofs.close();
+
+    std::ofstream poseofs(posefile, std::ios::out);
+    poseofs << std::fixed << std::setprecision(9);
+    for (const auto &state : optimized_states) {
+      Eigen::Quaterniond W_q_L(state.second.pose.block<4, 1>(3, 0));
+      Eigen::Vector3d W_p_L = state.second.pose.block<3, 1>(0, 0);
+      Eigen::Quaterniond E_q_W(est_E_T_tls.block<4, 1>(3, 0));
+      Eigen::Vector3d E_p_W = est_E_T_tls.block<3, 1>(0, 0);
+      Eigen::Quaterniond E_q_L = E_q_W * W_q_L;
+      Eigen::Vector3d E_p_L = E_p_W + E_q_W * W_p_L;
+      Eigen::Matrix3d E_R_L = E_q_L.toRotationMatrix();
+      poseofs << E_R_L(0, 0) << " " << E_R_L(0, 1) << " " << E_R_L(0, 2) << " "
+              << E_p_L.x() << " " << E_R_L(1, 0) << " " << E_R_L(1, 1) << " "
+              << E_R_L(1, 2) << " " << E_p_L.y() << " " << E_R_L(2, 0) << " "
+              << E_R_L(2, 1) << " " << E_R_L(2, 2) << " " << E_p_L.z()
+              << std::endl;
+    }
+    poseofs.close();
   }
 
   void saveEnuPoses(const std::string &enuFile) const {
@@ -1452,11 +1509,12 @@ int main(int argc, char **argv) {
   }
   if (FLAGS_opt_poses) {
     cpgo.OptimizePoseGraph(output_path);
-    std::string final_poses_file = output_path + "/final_poses.txt";
+    std::string final_poses_file = output_path + "/tls_X_xt32.txt";
     cpgo.saveResults(final_poses_file, true, false);
     if (cpgo.useGnss()) {
-      final_poses_file = output_path + "/final_georef_poses.txt";
+      final_poses_file = output_path + "/utm50r_T_xt32.txt";
       cpgo.saveGeorefResults(final_poses_file);
+      cpgo.saveGeorefResultsKitti(output_path);
     }
     cpgo.saveImuParams(output_path + "/imu_params.txt");
   }
