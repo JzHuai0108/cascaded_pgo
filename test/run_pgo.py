@@ -3,6 +3,7 @@ import argparse
 import numpy as np
 import os
 import scipy.spatial.transform
+import shutil
 import subprocess
 
 def T_from_pq(pq):
@@ -100,6 +101,26 @@ def run_pgo(datadir, resultdir, wsdir, shell_script, logfile):
         if result.stderr:
             print("Error:", result.stderr)
 
+def copy_pgo_trajs(resultdir, outbasename):
+    indir = os.path.join(resultdir, "pgo")
+    outdir = os.path.join(resultdir, outbasename)
+    count = 0
+    copyfilenames = ["utm50r_T_xt32.txt", "utm50r_T_xt32_kitti.txt", "times_kitti.txt"]
+    for bagname in sb.selected_bags.keys():
+        bagoutdir = os.path.join(outdir, bagname)
+        if not os.path.isdir(bagoutdir):
+            os.makedirs(bagoutdir)
+        for filename in copyfilenames:
+            infile = os.path.join(indir, bagname, filename)
+            outfile = os.path.join(bagoutdir, filename)
+            if not os.path.isfile(infile):
+                print(f"Warn: Missing {infile}")
+                continue
+            else:
+                shutil.copy(infile, outfile)
+                count += 1
+    print(f"Copied {count} files")
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser("""Run PGO on selected bags""", formatter_class=argparse.RawTextHelpFormatter)
@@ -113,4 +134,6 @@ if __name__ == "__main__":
 
     logfile = os.path.join(args.resultdir, "pgo", "run_pgo.log")
     run_pgo(args.datadir, args.resultdir, args.wsdir, shell_script, logfile)
+
+    # copy_pgo_trajs(args.resultdir, 'full_trajs')
     print("Done")
