@@ -73,7 +73,9 @@ def seq_available(bagname, datadir, resultdir):
     return True
 
 def run_pgo(datadir, resultdir, wsdir, shell_script, logfile):
+    # selected_bags = sb.selected_bags2
     selected_bags = sb.selected_bags
+
     E_pq_tls = sb.E_pq_tls.split()
     E_T_tls = T_from_pq(E_pq_tls)
 
@@ -124,8 +126,8 @@ def copy_pgo_trajs(resultdir, outbasename):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser("""Run PGO on selected bags""", formatter_class=argparse.RawTextHelpFormatter)
-    parser.add_argument("datadir", help="Directory containing the data")
-    parser.add_argument("resultdir", help="Directory to store the results")
+    parser.add_argument("datadir", help="Directory containing the sequence data, for getting the x36d IMU data.")
+    parser.add_argument("resultdir", help="Directory to store the results, for getting kissicp odometry, lio loc results, and gnss data")
     parser.add_argument("wsdir", help="Directory of the cascaded_pgo workspace")
 
     args = parser.parse_args()
