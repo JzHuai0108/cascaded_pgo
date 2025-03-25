@@ -1,45 +1,48 @@
-SET(PROJECT_NAME cascaded_pgo)
-PROJECT(${PROJECT_NAME})
-CMAKE_MINIMUM_REQUIRED (VERSION 2.8.3)
+cmake_minimum_required(VERSION 3.8)
+project(cascaded_pgo)
 
-SET(CMAKE_VERBOSE_MAKEFILE OFF)
-SET(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} "${PROJECT_SOURCE_DIR}/CMakeModules/")
+
+set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} "${PROJECT_SOURCE_DIR}/CMakeModules/")
 
 include(./CMakeModules/sanitizers.cmake)
 
-# Set build flags. Set IS_ARM on odroid board as environment variable
-SET(CMAKE_CXX_FLAGS "-std=c++14 -Wall -D_LINUX -D_REENTRANT -march=native -Wno-unused-variable -Wno-unused-but-set-variable -Wno-unknown-pragmas")
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
 
-IF(DEFINED ENV{ARM_ARCHITECTURE})
-  SET(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mfpu=neon -march=armv7-a")
-ELSE()
-  SET(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mmmx -msse -msse -msse2 -msse3 -mssse3")
-ENDIF()
+# Set build flags. Set IS_ARM on odroid board as an environment variable.
+add_compile_options(-O3 -march=native -fsee -fomit-frame-pointer -fno-signed-zeros -fno-math-errno 
+    -funroll-loops -Wall -Wextra -Wno-unused-variable -Wno-unused-but-set-variable 
+    -Wno-unknown-pragmas -Wnon-virtual-dtor -Wno-unused-function -pedantic)
 
-SET(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS} -O3 -fsee -fomit-frame-pointer -fno-signed-zeros -fno-math-errno -funroll-loops")
+add_definitions(-DGLOG_USE_GLOG_EXPORT)
 
-# Add plain cmake packages 
-FIND_PACKAGE(Eigen REQUIRED)
-find_package(Ceres 2.0 REQUIRED)
+if(DEFINED ENV{ARM_ARCHITECTURE})
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mfpu=neon -march=armv7-a")
+else()
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mmmx -msse -msse2 -msse3 -mssse3")
+endif()
 
-FIND_PACKAGE(catkin REQUIRED COMPONENTS roscpp cmake_modules)
+
+find_package(catkin REQUIRED COMPONENTS 
+  eigen_catkin
+  ceres_catkin
+  roscpp)
+
 catkin_package(
-  DEPENDS Eigen
-  CATKIN_DEPENDS roscpp
-  INCLUDE_DIRS
+  CATKIN_DEPENDS  eigen_catkin  ceres_catkin roscpp
+  INCLUDE_DIRS include
   LIBRARIES
 )
 
-INCLUDE_DIRECTORIES(
-  include
-  ${Eigen_INCLUDE_DIRS}
+include_directories(
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
   ${catkin_INCLUDE_DIRS}
 )
 
-ADD_EXECUTABLE(pgo
+add_executable(pgo
   src/Duration.cpp
   src/geodetic_enu_converter.cpp
-  src/hamilton_quaternion.cpp
   src/imu_parameters.cpp
   src/ImuErrorWithGravity.cpp
   src/pgo.cpp
@@ -47,4 +50,5 @@ ADD_EXECUTABLE(pgo
   src/Time.cpp
 )
 
-TARGET_LINK_LIBRARIES(pgo PUBLIC ${catkin_LIBRARIES} ${CERES_LIBRARIES} ${GFLAGS_LIBRARIES} glog)
+target_link_libraries(pgo PUBLIC ${catkin_LIBRARIES} gflags glog)
+

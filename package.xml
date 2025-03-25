@@ -1,31 +1,32 @@
 <?xml version="1.0"?>
-<package>
+<package format="2">
   <name>cascaded_pgo</name>
   <version>0.0.0</version>
   <description>The cascaded_pgo package</description>
 
-  <!-- One maintainer tag required, multiple allowed, one person per tag --> 
-  <!-- Example:  -->
-  <!-- <maintainer email="jane.doe@example.com">Jane Doe</maintainer> -->
+  <!-- Maintainer information (one maintainer per tag) -->
   <maintainer email="huai.3@osu.edu">jhuai</maintainer>
 
+  <!-- License information.
+       Common licenses include: BSD, MIT, Boost Software License, GPLv2, GPLv3, LGPLv2.1, LGPLv3 -->
+  <license>BSD</license>
 
-  <!-- One license tag required, multiple allowed, one license per tag -->
-  <!-- Commonly used license strings: -->
-  <!--   BSD, MIT, Boost Software License, GPLv2, GPLv3, LGPLv2.1, LGPLv3 -->
-  <license>GPLv3</license>
-
+  <!-- Build tool dependency -->
   <buildtool_depend>catkin</buildtool_depend>
+
+  <!-- Build dependencies -->
+  <build_depend>eigen_catkin</build_depend>
+  <build_depend>ceres_catkin</build_depend>
   <build_depend>roscpp</build_depend>
-  <build_depend>cmake_modules</build_depend>
-  <run_depend>roscpp</run_depend>
 
-  <!-- The export tag contains other, unspecified, tags -->
+  <!-- Execution dependencies -->
+  <exec_depend>eigen_catkin</exec_depend>
+  <exec_depend>ceres_catkin</exec_depend>
+  <exec_depend>roscpp</exec_depend>
+
+  <!-- Export additional package information here -->
   <export>
-    <!-- You can specify that this package is a metapackage here: -->
-    <!-- <metapackage/> -->
-
-    <!-- Other tools can request additional information be placed here -->
-
+    <!-- Additional export tags can be placed here, e.g., if this package is a metapackage:
+         <metapackage/> -->
   </export>
 </package>

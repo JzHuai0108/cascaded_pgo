@@ -8,40 +8,28 @@ The original world frame of the dense odometry poses does not affect the final t
 
 # Build
 This program depends on ceres solver.
-## ceres solver
-```
-cd /home/$USER/Documents/slam_src
-git clone --recursive https://github.com/ceres-solver/ceres-solver.git
-cd ceres-solver
-git checkout 2.1.0
-mkdir -p build && cd build
-cmake .. -DCMAKE_INSTALL_PREFIX=/home/$USER/Documents/slam_devel -DBUILD_SHARED_LIBS=ON \
-    -DCMAKE_BUILD_TYPE:STRING=Release -DBUILD_EXAMPLES:BOOL=OFF -DBUILD_TESTING:BOOL=OFF \
-    -DGLOG_INCLUDE_DIR_HINTS=/usr/include -DGLOG_LIBRARY_DIR_HINTS=/usr/lib
-
-make install
-```
 
 ## With ROS
 ```
 mkdir -p catkin_ws/src
 cd catkin_ws/src
-git clone --recursive git@bitbucket.org:JzHuai0108/densify_poses.git cascaded_pgo
 
-wstool init
-wstool merge cascaded_pgo/dependencies.rosinstall
-wstool update -j 8
+git clone git@github.com:catkin/catkin_simple.git
+git clone git@github.com:JzHuai0108/eigen_catkin.git
+git clone git@bitbucket.org:JzHuai0108/ceres_catkin.git
+git clone --recursive git@github.com:JzHuai0108/cascaded_pgo.git cascaded_pgo
+
 cd ..
-catkin build cascaded_pgo -DCMAKE_BUILD_TYPE=Release -j4 -DPYTHON_EXECUTABLE=/usr/bin/python3 \
-  -DCeres_DIR=/home/$USER/Documents/slam_devel/lib/cmake/Ceres \
-  -DGLOG_INCLUDE_DIR_HINTS=/usr/include -DGLOG_LIBRARY_DIR_HINTS=/usr/lib
-
+catkin build cascaded_pgo -DCMAKE_BUILD_TYPE=Release
+# for ceres catkin, you may need to pass
+# -DCMAKE_CUDA_ARCHITECTURES=89 -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc
+# to catkin build per your system.
 ```
 
 # Run
 ```
-densify_exe=/media/jhuai/docker/cascaded_pgo_ws/devel/lib/cascaded_pgo/pgo
+pgo_exe=/media/jhuai/docker/cascaded_pgo_ws/devel/lib/cascaded_pgo/pgo
 cd $OUTPUTDIR
-$densify_exe $OUTPUTDIR/trajectory.txt $OUTPUTDIR/keyframeTrajectory.txt
+$pgo_exe $OUTPUTDIR/trajectory.txt $OUTPUTDIR/keyframeTrajectory.txt
 ```
 
