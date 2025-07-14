@@ -120,42 +120,48 @@ size_t load_poses(
     std::cerr << "Failed to open file " << posefile << std::endl;
     return 1;
   }
-  while (!stream.eof()) {
-    std::string line;
-    std::getline(stream, line);
-    if (line[0] == '#') {
-      continue;
-    }
+  std::string line;
+  while (std::getline(stream, line)) {
+    // skip comments or empty lines
+    if (line.empty() || line[0] == '#') continue;
+
+    // replace all commas with spaces so we can parse either delimiter
+    std::replace(line.begin(), line.end(), ',', ' ');
+
     std::istringstream iss(line);
     std::string time_str;
     iss >> time_str;
-    if (time_str.empty()) {
-      break;
-    }
-    // keep the time precision to nanoseconds
+    if (time_str.empty()) break;
+
+    // parse time_str as before...
     std::string::size_type pos = time_str.find('.');
-    uint32_t sec, nsec;
+    uint32_t sec = 0, nsec = 0;
     try {
       sec = std::stoul(time_str.substr(0, pos));
       std::string nsecstr = time_str.substr(pos + 1);
-      if (nsecstr.size() < 9) {
-        nsecstr.append(9 - nsecstr.size(), '0');
-      }
+      if (nsecstr.size() < 9) nsecstr.append(9 - nsecstr.size(), '0');
       nsec = std::stoul(nsecstr);
     } catch (std::exception &e) {
-      std::cerr << "Failed to parse time string: " << time_str << " in "
-                << posefile << std::endl;
+      std::cerr << "Failed to parse time string: " << time_str
+                << " in " << posefile << std::endl;
       return 1;
     }
     okvis::Time time(sec, nsec);
 
-    Eigen::Matrix<double, 7, 1> pose;
+    // now read the 7 pose values (whitespace-delimited, works for both commas & spaces)
+    Eigen::Matrix<double,7,1> pose;
     for (size_t i = 0; i < 7; ++i) {
-      iss >> pose[i];
+      if (!(iss >> pose[i])) {
+        std::cerr << "Failed to read pose element " << i
+                  << " on line: " << line << std::endl;
+        return 1;
+      }
     }
+
     times.push_back(time);
     poses.push_back(pose);
   }
+
   if (times.empty()) {
     std::cerr << "No poses loaded from " << posefile << std::endl;
     return 1;
@@ -546,7 +552,7 @@ void associateAndUpdate(
     const std::vector<okvis::Time> &odom_times,
     const std::vector<Eigen::Matrix<double, 7, 1>,
                       Eigen::aligned_allocator<Eigen::Matrix<double, 7, 1>>>
-        &odom_poses,
+        &/*odom_poses*/,
     std::vector<okvis::Time> &loc_times,
     std::vector<Eigen::Matrix<double, 7, 1>,
                 Eigen::aligned_allocator<Eigen::Matrix<double, 7, 1>>>

@@ -19,11 +19,13 @@ def pq_from_T(T):
     return pq
 
 def transform_poses(bagname, resultdir, E_T_tls):
-    tls_loc_file = os.path.join(resultdir, "ref_trajs_all", bagname, "tls_T_xt32.txt")
+    tls_loc_file = os.path.join(resultdir, "fwd_bwd_loc", bagname, "ref_tls_T_xt32.csv")
     val_strs = []
     with open(tls_loc_file, "r") as f:
         for line in f:
-            val_strs.append(line.strip().split())
+            if line.startswith('#'):
+                continue
+            val_strs.append(line.strip().split(','))
     outputdir = os.path.join(resultdir, "pgo", bagname)
     if not os.path.isdir(outputdir):
         os.makedirs(outputdir)
@@ -34,7 +36,7 @@ def transform_poses(bagname, resultdir, E_T_tls):
     kt = open(outputkittitimes, "w")
     with open(outputfile, "w") as f:
         for vstr in val_strs:
-            pq = np.array([float(val) for val in vstr[1:]])
+            pq = np.array([float(val) for val in vstr[1:8]])
             W_T_L = T_from_pq(pq)
             E_T_L = E_T_tls @ W_T_L
             E_pq_L = pq_from_T(E_T_L)
@@ -55,8 +57,8 @@ def transform_poses(bagname, resultdir, E_T_tls):
 def seq_available(bagname, datadir, resultdir):
     run = bagname.split("/")[1]
     odom_file = os.path.join(resultdir, "kissicp", bagname, f"{run}_aligned_poses_tum.txt")
-    tls_loc_file = os.path.join(resultdir, "ref_trajs_all", bagname, "tls_T_xt32.txt")
-    gnss_loc_file = os.path.join(resultdir, "ref_trajs_all", bagname, "utm50r_T_x36dimu.txt")
+    tls_loc_file = os.path.join(resultdir, "fwd_bwd_loc", bagname, "ref_tls_T_xt32.csv")
+    gnss_loc_file = os.path.join(resultdir, "fwd_bwd_loc", bagname, "utm50r_T_x36dimu.txt")
     imu_file = os.path.join(datadir, bagname, "x36d", "imu.txt")
     if not os.path.isfile(odom_file):
         print(f"Missing odometry {odom_file}")
